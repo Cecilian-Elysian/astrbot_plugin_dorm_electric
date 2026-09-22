@@ -69,3 +69,21 @@ class Store:
             return None
         last = history[-1]
         return float(last["v"]), float(last["t"])
+
+    @staticmethod
+    def append_fee_history(
+        binding: dict,
+        fee: str,
+        value: float,
+        unit: str,
+        ts: float | None = None,
+        keep_days: int = 60,
+    ) -> None:
+        """保存指定费种的历史，避免度和元混在同一条曲线中。"""
+        ts = ts if ts is not None else time.time()
+        history = binding.setdefault("history_by_fee", {}).setdefault(fee, [])
+        history.append({"t": ts, "v": value, "u": unit})
+        cutoff = ts - 24 * 3600 * max(1, keep_days)
+        if len(history) > MAX_HISTORY:
+            del history[: len(history) - MAX_HISTORY]
+        binding["history_by_fee"][fee] = [h for h in history if h["t"] >= cutoff]

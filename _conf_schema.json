@@ -38,17 +38,17 @@
       "0030000000004301": "清美时雨春雪空调（校本部）",
       "0030000000014501": "十堰校区"
     },
-    "hint": "/电费 项目 指令会展示此列表，键为系统的 aid。如学校新增缴费项可在此添加。"
+    "hint": "第 1 项为空调费，第 2 项为宿舍电费。发送 /电费 项目 后选择空调费项目，绑定一次宿舍会自动关联两项。"
   },
   "threshold_warn": {
-    "description": "低余额预警线（度）",
-    "type": "float",
-    "default": 20
-  },
-  "threshold_critical": {
-    "description": "紧急预警线（度）",
+    "description": "低余额预警线（空调费为度，宿舍电费为元）",
     "type": "float",
     "default": 10
+  },
+  "threshold_critical": {
+    "description": "紧急预警线（空调费为度，宿舍电费为元）",
+    "type": "float",
+    "default": 5
   },
   "alert_cooldown_hours": {
     "description": "同级预警重复提醒间隔（小时）",
@@ -85,7 +85,7 @@
     "description": "查询请求使用的代理（可选）",
     "type": "string",
     "default": "",
-    "hint": "例如 http://127.0.0.1:7897。多数情况留空即可（学校接口可直连）。"
+    "hint": "留空为直连；也支持 http://127.0.0.1:7897 或 socks5://127.0.0.1:7897。"
   },
   "history_keep_days": {
     "description": "历史数据保留天数",

@@ -25,12 +25,14 @@ class SessionExpiredError(QueryError):
 
 
 # 例：A-8-17房间当前剩余电量94.66度
-BALANCE_RE = re.compile(r"剩余电量\s*([0-9]+(?:\.[0-9]+)?)\s*度")
+BALANCE_RE = re.compile(
+    r"(?:剩余电量\s*([0-9]+(?:\.[0-9]+)?)\s*度|余额\s*[：:]\s*([0-9]+(?:\.[0-9]+)?)\s*元)"
+)
 ROOM_RE = re.compile(r"^\s*(\S+?)房间")
 
 
-def parse_balance(raw_msg: str) -> tuple[float, str] | None:
-    """从 errmsg 文本中解析 (余额度数, 房间名)，解析失败返回 None。"""
+def parse_balance(raw_msg: str) -> tuple[float, str, str] | None:
+    """从 errmsg 文本中解析 (余额, 房间名, 单位)。"""
     m = BALANCE_RE.search(raw_msg or "")
     if not m:
         return None
@@ -38,7 +40,9 @@ def parse_balance(raw_msg: str) -> tuple[float, str] | None:
     mr = ROOM_RE.search(raw_msg or "")
     if mr:
         room = mr.group(1)
-    return float(m.group(1)), room
+    if m.group(1) is not None:
+        return float(m.group(1)), room, "度"
+    return float(m.group(2)), room, "元"
 
 
 class HjnuProvider(ElecProvider):
@@ -105,7 +109,12 @@ class HjnuProvider(ElecProvider):
                 headers=self._headers(),
             )
         except httpx.HTTPError as e:
-            return 0, "", f"网络请求失败：{e!r}"
+            hint = (
+                "请检查 http_proxy 代理节点是否可用"
+                if self.proxy
+                else "请检查宿主机是否能直连学校接口，或配置 http_proxy 代理节点"
+            )
+            return 0, "", f"网络请求失败：{e!r}；{hint}"
         try:
             text = resp.text
         except Exception:
@@ -173,8 +182,10 @@ class HjnuProvider(ElecProvider):
         parsed = parse_balance(raw_msg)
         if parsed is None:
             return BalanceResult(ok=False, value=None, raw=raw_msg or "接口未返回余额文本")
-        value, room = parsed
-        return BalanceResult(ok=True, value=value, raw=raw_msg, extra={"room": room})
+        value, room, unit = parsed
+        return BalanceResult(
+            ok=True, value=value, raw=raw_msg, unit=unit, extra={"room": room}
+        )
 
     async def list_areas(self, aid: str) -> list[dict]:
         data = await self._post("/wechat/basicQuery/queryElecArea.html", {"aid": aid})

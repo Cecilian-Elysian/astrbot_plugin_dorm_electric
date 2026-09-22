@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 class BalanceResult:
     """一次余额查询的结果。
 
-    value 单位为“度”，由各数据源负责解析。
+    unit 保存数值单位（例如“度”或“元”），由各数据源负责解析。
     raw 保存原始 errmsg 或错误说明，便于调试与展示。
     """
 
@@ -16,6 +16,7 @@ class BalanceResult:
     raw: str
     session_expired: bool = False
     extra: dict = field(default_factory=dict)
+    unit: str = "度"
 
 
 class QueryError(Exception):
