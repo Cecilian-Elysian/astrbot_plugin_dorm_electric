@@ -2,6 +2,6 @@ name: astrbot_plugin_dorm_electric
 display_name: 宿舍电费监控
 desc: 宿舍电费余额监控预警：低余额/可用天数预警、每日定时播报，支持学校缴费系统自动查询与手动登记两种模式。
 short_desc: 宿舍电费余额监控与低余额预警。
-version: v1.0.0
+version: v1.0.1
 author: Cecilian
-repo: https://github.com/example/astrbot_plugin_dorm_electric
+repo: https://github.com/Cecilian-Elysian/astrbot_plugin_dorm_electric

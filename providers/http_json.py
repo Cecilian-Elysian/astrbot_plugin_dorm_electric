@@ -6,7 +6,9 @@
 - 未认证时返回 {"retcode": "91001", "errmsg": "会话已超时…"}
 """
 
+import asyncio
 import json
+import logging
 import re
 
 import httpx
@@ -14,6 +16,8 @@ import httpx
 from .base import BalanceResult, ElecProvider, QueryError
 
 SESSION_EXPIRED_CODE = "91001"
+
+logger = logging.getLogger("astrbot.plugin.dorm_electric")
 
 
 class SessionExpiredError(QueryError):
@@ -91,7 +95,8 @@ class HjnuProvider(ElecProvider):
     def _j(obj) -> str:
         return json.dumps(obj, ensure_ascii=False)
 
-    async def _post(self, path: str, fields: dict) -> dict:
+    async def _post_once(self, path: str, fields: dict) -> tuple[int, str, str]:
+        """单次请求，返回 (status, text, err)；err 非空表示网络层失败。"""
         client = self._get_client()
         try:
             resp = await client.post(
@@ -100,16 +105,44 @@ class HjnuProvider(ElecProvider):
                 headers=self._headers(),
             )
         except httpx.HTTPError as e:
-            raise QueryError(f"网络请求失败：{e!r}") from e
-        if resp.status_code != 200:
-            raise QueryError(f"接口返回 HTTP {resp.status_code}")
+            return 0, "", f"网络请求失败：{e!r}"
         try:
-            data = resp.json()
-        except ValueError as e:
-            raise QueryError("接口返回的不是 JSON（可能凭证已被服务端作废）") from e
-        if not isinstance(data, dict):
-            raise QueryError("接口返回了意外结构")
-        return data
+            text = resp.text
+        except Exception:
+            text = ""
+        return resp.status_code, text, ""
+
+    async def _post(self, path: str, fields: dict) -> dict:
+        # 5xx（如学校服务器偶发 502）自动换新连接重试 2 次
+        last_err = ""
+        for attempt in range(3):
+            status, text, net_err = await self._post_once(path, fields)
+            if net_err:
+                last_err = net_err
+                logger.error("电费接口网络错误(%s)：%s", path, net_err)
+            elif status == 200:
+                try:
+                    data = json.loads(text)
+                except ValueError as e:
+                    snippet = (text or "").strip()[:200]
+                    logger.error("电费接口返回非 JSON(%s)：%s", path, snippet)
+                    raise QueryError("接口返回的不是 JSON（可能凭证已被服务端作废）") from e
+                if not isinstance(data, dict):
+                    raise QueryError("接口返回了意外结构")
+                return data
+            else:
+                snippet = (text or "").strip()[:200]
+                last_err = f"接口返回 HTTP {status}"
+                logger.error("电费接口 HTTP %s(%s)：%s", status, path, snippet)
+                if status < 500:
+                    break
+            if attempt < 2:
+                await asyncio.sleep(1.5)
+                # 5xx/网络错误时丢弃旧连接，避免复用异常连接
+                if self._client is not None and not self._client.is_closed:
+                    await self._client.aclose()
+                self._client = None
+        raise QueryError(f"{last_err}（学校服务器暂时无响应，已自动重试仍失败，请稍后再试）")
 
     @staticmethod
     def _check(data: dict) -> None:

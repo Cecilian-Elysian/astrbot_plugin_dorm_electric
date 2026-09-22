@@ -19,10 +19,15 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
 try:
-    from .providers import HjnuProvider, ManualProvider, QueryError
+    from .providers import HjnuProvider, ManualProvider, QueryError, SessionExpiredError
     from .storage import Store
 except ImportError:  # 兜底：被以非包方式加载时
-    from providers import HjnuProvider, ManualProvider, QueryError  # type: ignore
+    from providers import (  # type: ignore
+        HjnuProvider,
+        ManualProvider,
+        QueryError,
+        SessionExpiredError,
+    )
     from storage import Store  # type: ignore
 
 try:
@@ -34,6 +39,13 @@ except ImportError:
 
 
 PLUGIN_NAME = "astrbot_plugin_dorm_electric"
+
+CREDENTIAL_HINT = (
+    "🔐 学校系统凭证已失效或尚未配置。\n"
+    "请重新获取 JSESSIONID 后发送：/电费 凭证 JSESSIONID=xxxx\n"
+    "（获取方式：企业微信打开缴费查询页，用抓包工具复制请求头 Cookie；\n"
+    "期间也可用 /电费 登记 <度数> 手动记录余额）"
+)
 
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -453,6 +465,8 @@ class DormElectricPlugin(Star):
                 return
         try:
             areas = await self.hjnu.list_areas(aid)
+        except SessionExpiredError:
+            yield event.plain_result(CREDENTIAL_HINT)
         except QueryError as e:
             yield event.plain_result(f"❌ {e}")
             return
@@ -479,6 +493,8 @@ class DormElectricPlugin(Star):
             return
         try:
             buildings = await self.hjnu.list_buildings(wizard["aid"], area)
+        except SessionExpiredError:
+            yield event.plain_result(CREDENTIAL_HINT)
         except QueryError as e:
             yield event.plain_result(f"❌ {e}")
             return
@@ -507,6 +523,8 @@ class DormElectricPlugin(Star):
             return
         try:
             floors = await self.hjnu.list_floors(wizard["aid"], wizard["area"], building)
+        except SessionExpiredError:
+            yield event.plain_result(CREDENTIAL_HINT)
         except QueryError as e:
             yield event.plain_result(f"❌ {e}")
             return
@@ -537,6 +555,8 @@ class DormElectricPlugin(Star):
             rooms = await self.hjnu.list_rooms(
                 wizard["aid"], wizard["area"], wizard["building"], floor
             )
+        except SessionExpiredError:
+            yield event.plain_result(CREDENTIAL_HINT)
         except QueryError as e:
             yield event.plain_result(f"❌ {e}")
             return

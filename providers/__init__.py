@@ -1,7 +1,7 @@
 """余额数据源提供者包。"""
 
 from .base import BalanceResult, ElecProvider, QueryError
-from .http_json import HjnuProvider
+from .http_json import HjnuProvider, SessionExpiredError
 from .manual import ManualProvider
 
 __all__ = [
@@ -10,4 +10,5 @@ __all__ = [
     "HjnuProvider",
     "ManualProvider",
     "QueryError",
+    "SessionExpiredError",
 ]
