@@ -212,6 +212,12 @@ class DormElectricPlugin(Star):
             return
         bindings = self.store.data.get("bindings", {})
         for umo, binding in list(bindings.items()):
+            if binding.get("provider") == "manual":
+                # 手动登记：无网络查询，直接基于登记值评估预警
+                mv = binding.get("manual_value")
+                if mv is not None:
+                    await self._evaluate_alerts(umo, binding, float(mv))
+                continue
             if binding.get("provider") != "hjnu":
                 continue
             result = await self._safe_fetch(binding)
