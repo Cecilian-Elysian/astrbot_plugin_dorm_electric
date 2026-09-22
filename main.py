@@ -11,7 +11,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import pytz
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # Python < 3.9
+    from backports.zoneinfo import ZoneInfo  # type: ignore
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -88,7 +92,7 @@ class DormElectricPlugin(Star):
             )
         if self._cfg("daily_report", True):
             hour, minute = self._parse_daily_time(self._cfg("daily_time", "08:00"))
-            tz = pytz.timezone(str(self._cfg("daily_timezone", "Asia/Shanghai")))
+            tz = ZoneInfo(str(self._cfg("daily_timezone", "Asia/Shanghai")))
             self.scheduler.add_job(
                 self._daily_all,
                 CronTrigger(hour=hour, minute=minute, timezone=tz),
@@ -275,7 +279,7 @@ class DormElectricPlugin(Star):
     async def _daily_all(self):
         if not self.store:
             return
-        tz = pytz.timezone(str(self._cfg("daily_timezone", "Asia/Shanghai")))
+        tz = ZoneInfo(str(self._cfg("daily_timezone", "Asia/Shanghai")))
         today = datetime.now(tz).date().isoformat()
         bindings = self.store.data.get("bindings", {})
         for umo, binding in list(bindings.items()):
