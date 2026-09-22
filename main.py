@@ -8,13 +8,8 @@
 
 import asyncio
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:  # Python < 3.9
-    from backports.zoneinfo import ZoneInfo  # type: ignore
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -92,7 +87,7 @@ class DormElectricPlugin(Star):
             )
         if self._cfg("daily_report", True):
             hour, minute = self._parse_daily_time(self._cfg("daily_time", "08:00"))
-            tz = ZoneInfo(str(self._cfg("daily_timezone", "Asia/Shanghai")))
+            tz = self._resolve_tz(self._cfg("daily_timezone", "Asia/Shanghai"))
             self.scheduler.add_job(
                 self._daily_all,
                 CronTrigger(hour=hour, minute=minute, timezone=tz),
@@ -158,6 +153,21 @@ class DormElectricPlugin(Star):
             return int(parts[0]) % 24, int(parts[1]) % 60
         except (ValueError, IndexError):
             return 8, 0
+
+    @staticmethod
+    def _resolve_tz(name: str) -> timezone:
+        """解析时区配置为标准库 timezone 对象，零外部依赖。
+
+        当前仅识别 Asia/Shanghai（CST，UTC+8）。其他字符串回退为 UTC。
+        """
+        n = str(name or "").strip()
+        if "Shanghai" in n or n in ("CST", "CST-8", "+08", "+08:00"):
+            return timezone(timedelta(hours=8))
+        try:
+            offset = int(n)
+            return timezone(timedelta(hours=offset))
+        except ValueError:
+            return timezone.utc
 
     def _binding_label(self, binding: dict) -> str:
         return binding.get("room_label") or binding.get("params", {}).get("room", {}).get(
@@ -279,7 +289,7 @@ class DormElectricPlugin(Star):
     async def _daily_all(self):
         if not self.store:
             return
-        tz = ZoneInfo(str(self._cfg("daily_timezone", "Asia/Shanghai")))
+        tz = self._resolve_tz(self._cfg("daily_timezone", "Asia/Shanghai"))
         today = datetime.now(tz).date().isoformat()
         bindings = self.store.data.get("bindings", {})
         for umo, binding in list(bindings.items()):
