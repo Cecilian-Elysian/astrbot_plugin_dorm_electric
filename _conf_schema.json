@@ -1,0 +1,95 @@
+{
+  "hjnu_base": {
+    "description": "学校缴费系统地址",
+    "type": "string",
+    "default": "http://pay2.hjnu.edu.cn",
+    "hint": "汉江师范学院默认即可，一般无需修改。"
+  },
+  "hjnu_query_path": {
+    "description": "余额查询接口路径",
+    "type": "string",
+    "default": "/wechat/basicQuery/queryElecRoomInfo.html",
+    "hint": "默认即可。"
+  },
+  "hjnu_cookie": {
+    "description": "缴费系统会话凭证（JSESSIONID）",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "obvious_hint": true,
+    "hint": "从企业微信抓包获取的 Cookie，例如 JSESSIONID=xxxx。失效后可用指令 /电费 凭证 更新，无需重启。"
+  },
+  "hjnu_user_agent": {
+    "description": "请求 UA（需包含 wxwork 标识）",
+    "type": "string",
+    "default": "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.5304.110 Safari/537.36 Language/zh ColorScheme/Light wxwork/5.0.11 (MicroMessenger/6.2) WindowsWechat MailPlugin_Electron WeMail embeddisk wwmver/3.26.511.637 noMediaCs/true",
+    "hint": "服务器会校验 UA 中的 wxwork 字样，默认值即可。"
+  },
+  "hjnu_referer": {
+    "description": "请求 Referer",
+    "type": "string",
+    "default": "http://pay2.hjnu.edu.cn/wechat/elecpay/queryelec.html"
+  },
+  "fee_items": {
+    "description": "缴费项目列表（aid → 名称）",
+    "type": "dict",
+    "items": {},
+    "default": {
+      "0030000000004301": "清美时雨春雪空调（校本部）",
+      "0030000000014501": "十堰校区"
+    },
+    "hint": "/电费 项目 指令会展示此列表，键为系统的 aid。如学校新增缴费项可在此添加。"
+  },
+  "threshold_warn": {
+    "description": "低余额预警线（度）",
+    "type": "float",
+    "default": 20
+  },
+  "threshold_critical": {
+    "description": "紧急预警线（度）",
+    "type": "float",
+    "default": 10
+  },
+  "alert_cooldown_hours": {
+    "description": "同级预警重复提醒间隔（小时）",
+    "type": "float",
+    "default": 24
+  },
+  "poll_interval_minutes": {
+    "description": "余额轮询间隔（分钟，0 关闭轮询）",
+    "type": "int",
+    "default": 20,
+    "hint": "轮询同时起到保持会话凭证活跃的作用，建议 20~30 分钟，最小 5 分钟。"
+  },
+  "daily_report": {
+    "description": "启用每日定时播报",
+    "type": "bool",
+    "default": true
+  },
+  "daily_time": {
+    "description": "每日播报时间（HH:MM）",
+    "type": "string",
+    "default": "08:00"
+  },
+  "daily_timezone": {
+    "description": "播报时区",
+    "type": "string",
+    "default": "Asia/Shanghai"
+  },
+  "request_timeout_seconds": {
+    "description": "查询请求超时（秒）",
+    "type": "int",
+    "default": 15
+  },
+  "http_proxy": {
+    "description": "查询请求使用的代理（可选）",
+    "type": "string",
+    "default": "",
+    "hint": "例如 http://127.0.0.1:7897。多数情况留空即可（学校接口可直连）。"
+  },
+  "history_keep_days": {
+    "description": "历史数据保留天数",
+    "type": "int",
+    "default": 60
+  }
+}
