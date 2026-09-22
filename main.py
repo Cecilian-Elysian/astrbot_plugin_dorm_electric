@@ -65,7 +65,7 @@ def electric():
     PLUGIN_NAME,
     "Cecilian",
     "宿舍电费余额监控预警：低余额预警、每日播报、可用天数预估",
-    "1.0.3",
+    "1.0.4",
 )
 class DormElectricPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -743,7 +743,7 @@ class DormElectricPlugin(Star):
         """绑定房间并开始监控"""
         umo = event.unified_msg_origin
         wizard = self._wizard.get(umo) or {}
-        if room_id != "1" or wizard.get("step") != "bind" or not wizard.get("room"):
+        if str(room_id) != "1" or wizard.get("step") != "bind" or not wizard.get("room"):
             yield event.plain_result("请发送 /电费 绑定 1 确认当前选中的宿舍")
             return
         room = wizard["room"]
