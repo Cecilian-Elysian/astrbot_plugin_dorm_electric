@@ -2,13 +2,11 @@
 
 from .base import BalanceResult, ElecProvider, QueryError
 from .http_json import HjnuProvider, SessionExpiredError
-from .manual import ManualProvider
 
 __all__ = [
     "BalanceResult",
     "ElecProvider",
     "HjnuProvider",
-    "ManualProvider",
     "QueryError",
     "SessionExpiredError",
 ]

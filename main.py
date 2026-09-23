@@ -1,16 +1,19 @@
 """宿舍电费余额监控预警插件。
 
-- /电费 指令组：向导式绑定房间、查询、手动登记、更新凭证等
-- 定时轮询余额 → 低余额/紧急预警（含冷却），轮询同时保活会话凭证
-- 每日定时播报：当前余额、近 24h 用电、预计可用天数
-- 双数据源：hjnu（学校缴费系统自动查询）/ manual（手动登记兜底）
+- /电费 指令组：绑定宿舍向导、查询、状态、凭证、历史、日志
+- 定时轮询余额 → 低余额/紧急预警（含冷却），预警按会话合并为单条消息
+- 轮询同时保活学校缴费系统会话凭证
+- 每日定时播报：当前余额（两种费种）
+- 数据源：hjnu（学校缴费系统自动查询）
 """
 
 import asyncio
 import re
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -20,15 +23,10 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
 try:
-    from .providers import HjnuProvider, ManualProvider, QueryError, SessionExpiredError
+    from .providers import HjnuProvider, QueryError, SessionExpiredError
     from .storage import Store
 except ImportError:  # 兜底：被以非包方式加载时
-    from providers import (  # type: ignore
-        HjnuProvider,
-        ManualProvider,
-        QueryError,
-        SessionExpiredError,
-    )
+    from providers import HjnuProvider, QueryError, SessionExpiredError  # type: ignore
     from storage import Store  # type: ignore
 
 try:
@@ -64,8 +62,8 @@ def electric():
 @register(
     PLUGIN_NAME,
     "Cecilian",
-    "宿舍电费余额监控预警：低余额预警、每日播报、可用天数预估",
-    "1.0.4",
+    "宿舍电费余额监控预警：低余额预警、每日播报、双费种同时查询",
+    "1.0.5",
 )
 class DormElectricPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -73,10 +71,12 @@ class DormElectricPlugin(Star):
         self.config = config
         self.store: Store | None = None
         self.hjnu: HjnuProvider | None = None
-        self.manual = ManualProvider()
         self.scheduler: AsyncIOScheduler | None = None
         self._wizard: dict[str, dict] = {}
         self._tasks: list[asyncio.Task] = []
+        self._events: deque = deque(maxlen=200)
+        self._pending_alerts: dict[str, list[dict]] = {}
+        self._last_raw: dict[str, dict[str, Any]] = {}
 
     # ================= 生命周期 =================
 
@@ -125,6 +125,7 @@ class DormElectricPlugin(Star):
                 logger.error(f"[{PLUGIN_NAME}] 保存数据失败：{e}")
         for t in self._tasks:
             t.cancel()
+        self._pending_alerts.clear()
 
     # ================= 工具方法 =================
 
@@ -197,9 +198,7 @@ class DormElectricPlugin(Star):
             return fees
         params = binding.get("params")
         if params:
-            return {"ac": {"provider": binding.get("provider", "hjnu"), "params": params}}
-        if binding.get("provider") == "manual":
-            return {"ac": binding}
+            return {"ac": {"provider": "hjnu", "params": params}}
         return {}
 
     @staticmethod
@@ -207,13 +206,10 @@ class DormElectricPlugin(Star):
         return entry.get("params") or {}
 
     async def _fetch_entry(self, entry: dict):
-        provider = self.hjnu if entry.get("provider", "hjnu") == "hjnu" else self.manual
-        if provider is None:
+        if not self.hjnu:
             return None
         try:
-            if entry.get("provider") == "manual":
-                return await provider.fetch(entry)
-            return await provider.fetch({"params": self._fee_params(entry)})
+            return await self.hjnu.fetch({"params": self._fee_params(entry)})
         except QueryError as e:
             logger.warning(f"[{PLUGIN_NAME}] 查询失败：{e}")
             return None
@@ -312,8 +308,7 @@ class DormElectricPlugin(Star):
             logger.error(f"[{PLUGIN_NAME}] 推送失败到 {umo}: {e!r}")
 
     def _provider_of(self, binding: dict):
-        name = binding.get("provider", "hjnu")
-        return self.hjnu if name == "hjnu" else self.manual
+        return self.hjnu
 
     async def _startup_poll(self):
         await asyncio.sleep(8)
@@ -330,14 +325,6 @@ class DormElectricPlugin(Star):
             return
         bindings = self.store.data.get("bindings", {})
         for umo, binding in list(bindings.items()):
-            if binding.get("provider") == "manual":
-                # 手动登记：无网络查询，直接基于登记值评估预警
-                mv = binding.get("manual_value")
-                if mv is not None:
-                    await self._evaluate_alerts(umo, binding, float(mv))
-                continue
-            if binding.get("provider") != "hjnu":
-                continue
             for kind, entry in self._fee_bindings(binding).items():
                 result = await self._fetch_entry(entry)
                 if result is None:
@@ -350,25 +337,21 @@ class DormElectricPlugin(Star):
                         result.unit,
                         keep_days=int(self._cfg("history_keep_days", 60)),
                     )
-                    await self._evaluate_alerts(umo, binding, result.value, kind, result.unit)
+                    await self._evaluate_alerts(
+                        umo, binding, result.value, kind, result.unit
+                    )
                 elif result.session_expired:
                     await self._notify_session_dead(umo, binding)
             self.store.save()
+            self._record_event(
+                umo, "poll", f"轮询：{self._binding_label(binding)}"
+            )
+        await self._flush_alerts()
 
-    async def _safe_fetch(self, binding: dict):
-        provider = self._provider_of(binding)
-        if provider is None:
-            return None
-        try:
-            return await provider.fetch(binding)
-        except QueryError as e:
-            logger.warning(f"[{PLUGIN_NAME}] 查询失败：{e}")
-            return None
-        except Exception as e:
-            logger.error(f"[{PLUGIN_NAME}] 查询异常：{e!r}")
-            return None
-
-    async def _evaluate_alerts(self, umo: str, binding: dict, value: float, kind="ac", unit="度"):
+    async def _evaluate_alerts(
+        self, umo: str, binding: dict, value: float, kind: str = "ac", unit: str = "度"
+    ):
+        """评估预警：仅更新 state 与 pending_alerts，由 _flush_alerts 统一发送。"""
         warn = float(self._cfg("threshold_warn", 10))
         critical = float(self._cfg("threshold_critical", 5))
         cooldown = float(self._cfg("alert_cooldown_hours", 24)) * 3600
@@ -388,7 +371,6 @@ class DormElectricPlugin(Star):
         state = alert_state.setdefault(kind, {})
         prev = int(state.get("level", 0))
         now = time.time()
-        label = self._binding_label(binding)
 
         if level == 0:
             state["level"] = 0
@@ -398,22 +380,53 @@ class DormElectricPlugin(Star):
         if not need:
             return
 
-        if level == 2:
-            text = (
-                f"🚨 {self._fee_name(kind)}紧急预警 | {label}\n"
-                f"当前剩余：{value:.2f} {unit}（≤ 紧急线 {critical:g} {unit}）\n"
-                "余额可能即将耗尽，请立即充值！"
-            )
-        else:
-            text = (
-                f"⚠️ {self._fee_name(kind)}低余额预警 | {label}\n"
-                f"当前剩余：{value:.2f} {unit}（≤ 预警线 {warn:g} {unit}）\n"
-                "建议尽快充值。"
-            )
-        await self._send(umo, text)
+        self._pending_alerts.setdefault(umo, []).append(
+            {
+                "kind": kind,
+                "level": level,
+                "value": value,
+                "unit": unit,
+                "warn": warn,
+                "critical": critical,
+                "at": now,
+            }
+        )
         state["level"] = level
         state.setdefault("last_alert_at", {})[str(level)] = now
         self.store.save()
+
+    async def _flush_alerts(self) -> None:
+        """将本轮所有 pending 预警合并为单条消息发送。"""
+        if not self._pending_alerts:
+            return
+        for umo, items in self._pending_alerts.items():
+            if not items:
+                continue
+            binding = self.store.get_binding(umo) if self.store else None
+            label = self._binding_label(binding) if binding else "未知房间"
+            has_critical = any(i["level"] == 2 for i in items)
+            header = "🚨 余额预警" if has_critical else "⚠️ 余额预警"
+            lines = [f"{header} | {label}"]
+            for i in items:
+                if i["level"] == 2:
+                    lines.append(
+                        f"  {self._fee_name(i['kind'])}：{i['value']:.2f} {i['unit']}（≤ 紧急线 {i['critical']:g}）"
+                    )
+                else:
+                    lines.append(
+                        f"  {self._fee_name(i['kind'])}：{i['value']:.2f} {i['unit']}（≤ 预警线 {i['warn']:g}）"
+                    )
+            if has_critical:
+                lines.append("请立即充值。")
+            else:
+                lines.append("建议尽快充值。")
+            await self._send(umo, "\n".join(lines))
+            self._record_event(
+                umo,
+                "alert",
+                f"{header}（{len(items)} 项）",
+            )
+        self._pending_alerts.clear()
 
     async def _notify_session_dead(self, umo: str, binding: dict):
         state = binding.setdefault("alert_state", {})
@@ -444,27 +457,17 @@ class DormElectricPlugin(Star):
             text = self._daily_text(binding)
             if text:
                 await self._send(umo, text)
+                self._record_event(umo, "info", f"每日播报已发送：{self._binding_label(binding)}")
 
     def _daily_text(self, binding: dict) -> str | None:
         label = self._binding_label(binding)
-        if binding.get("provider") == "manual":
-            value = binding.get("manual_value")
-            if value is None:
-                return None
-            return (
-                f"☀️ 每日电费播报 | {label}\n"
-                f"手动登记余额：{float(value):.2f} 度\n"
-                "提示：发送 /电费 登记 <最新读数> 更新。"
-            )
         histories = binding.get("history_by_fee") or {}
         if not histories:
-            latest = self.store.latest_value(binding)
+            latest = self.store.latest_value(binding) if self.store else None
             if latest is None:
                 return None
             return f"☀️ 每日电费播报 | {label}\n空调费：{latest[0]:.2f} 度"
-        lines = [
-            f"☀️ 每日电费播报 | {label}",
-        ]
+        lines = [f"☀️ 每日电费播报 | {label}"]
         for kind in ("ac", "elec"):
             history = histories.get(kind) or []
             if not history:
@@ -472,6 +475,51 @@ class DormElectricPlugin(Star):
             value = float(history[-1]["v"])
             lines.append(f"{self._fee_name(kind)}：{value:.2f} {history[-1].get('u', '度')}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _history_stats(history: list[dict]) -> dict | None:
+        """计算 24h 用电、日均、最低/最高。"""
+        if len(history) < 1:
+            return None
+        values = [float(h["v"]) for h in history]
+        ts = [float(h["t"]) for h in history]
+        unit = history[-1].get("u", "度")
+        now = time.time()
+        min_v = min(values)
+        max_v = max(values)
+
+        # 24h 用电：找最接近 (now-24h) 时刻的样本差值
+        ref = history[0]
+        for h in history:
+            if now - float(h["t"]) >= 24 * 3600:
+                ref = h
+            else:
+                break
+        usage_24h = float(ref["v"]) - values[-1]
+        if usage_24h < 0:
+            usage_24h = 0.0
+
+        # 日均：按全历史跨度
+        span_days = (ts[-1] - ts[0]) / 86400
+        per_day = None
+        if span_days >= 0.5 and len(history) >= 2:
+            drop = values[0] - values[-1]
+            if drop > 0:
+                per_day = drop / span_days
+
+        return {
+            "usage_24h": usage_24h,
+            "per_day": per_day if per_day is not None else 0.0,
+            "min": min_v,
+            "max": max_v,
+            "unit": unit,
+        }
+
+    def _record_event(self, umo: str, kind: str, text: str) -> None:
+        """记录一条事件到内存事件流。"""
+        self._events.append(
+            {"t": time.time(), "kind": kind, "text": text, "umo": umo}
+        )
 
     @staticmethod
     def _usage_since(binding: dict, hours: float) -> float | None:
@@ -513,16 +561,15 @@ class DormElectricPlugin(Star):
         """查看指令帮助"""
         yield event.plain_result(
             "⚡ 宿舍电费监控指令：\n"
-            "/电费 项目 — 查看项目并开始绑定向导\n"
-            "/电费 选择 <项目编号> — 选择项目并查看校区\n"
+            "/电费 绑定 — 启动绑定宿舍向导（自动同时关联空调费 + 宿舍电费）\n"
             "/电费 校区/楼栋/楼层/房间 <编号> — 逐级选择宿舍\n"
-            "/电费 绑定 1 — 确认绑定并自动关联两种费用\n"
-            "/电费 查询 — 同时查询空调费和宿舍电费\n"
-            "/电费 登记 <度数> — 手动登记余额（无需凭证）\n"
-            "/电费 凭证 <JSESSIONID=...> — 更新会话凭证\n"
-            "/电费 状态 — 查看绑定与运行状态\n"
+            "/电费 绑定 1 — 确认绑定\n"
             "/电费 解绑 — 取消监控\n"
-            "/电费 测试 — 测试两项查询并显示原始返回\n"
+            "/电费 查询 — 同时查询空调费和宿舍电费\n"
+            "/电费 凭证 <JSESSIONID=...> — 更新会话凭证（热更新，无需重启）\n"
+            "/电费 历史 [n] — 查看最近 n 条余额记录（默认 7，最多 60）\n"
+            "/电费 日志 [n] — 查看最近 n 条事件 + 最近一次原始返回（默认 20，最多 100）\n"
+            "/电费 状态 — 查看绑定与运行状态\n"
             "预警线：10；紧急线：5（空调费单位为度，宿舍电费单位为元）"
         )
 
@@ -546,11 +593,9 @@ class DormElectricPlugin(Star):
             ),
         ]
         if not binding:
-            lines.append("绑定：❌ 未绑定（/电费 项目 开始绑定）")
+            lines.append("绑定：❌ 未绑定（/电费 绑定 开始）")
         else:
-            lines.append(
-                f"绑定：✅ {self._binding_label(binding)}（模式 {binding.get('provider')}）"
-            )
+            lines.append(f"绑定：✅ {self._binding_label(binding)}")
             fees = self._fee_bindings(binding)
             if fees:
                 lines.append("已关联：" + "、".join(self._fee_name(kind) for kind in fees))
@@ -571,60 +616,6 @@ class DormElectricPlugin(Star):
 
     # ================= 指令：绑定向导 =================
 
-    @electric.command("项目")
-    async def cmd_items(self, event: AstrMessageEvent):
-        """列出可用的缴费项目"""
-        items = self.config.get("fee_items", {}) or {}
-        if not items:
-            yield event.plain_result("配置中没有任何缴费项目（fee_items）。")
-            return
-        lines = ["📋 缴费项目："]
-        for i, (aid, label) in enumerate(items.items(), 1):
-            lines.append(f"{i}. {label}（{aid}）")
-        lines.extend([
-            "",
-            "请选择要绑定的宿舍项目：",
-            "发送 /电费 选择 <项目编号>",
-            "绑定一个宿舍后，会自动同时查询空调费和宿舍电费。",
-        ])
-        umo = event.unified_msg_origin
-        self._wizard[umo] = {"items": list(items.keys()), "step": "project"}
-        yield event.plain_result("\n".join(lines))
-
-    @electric.command("选择")
-    async def cmd_select(self, event: AstrMessageEvent, project_id: str | None = None):
-        """选择缴费项目并加载校区。"""
-        umo = event.unified_msg_origin
-        wizard = self._wizard.get(umo) or {}
-        items = self.config.get("fee_items", {}) or {}
-        aids = wizard.get("items") or list(items)
-        if project_id is None:
-            yield event.plain_result("用法：/电费 选择 <项目编号>，例如 /电费 选择 1")
-            return
-        try:
-            aid = aids[int(project_id) - 1]
-        except (ValueError, IndexError):
-            yield event.plain_result("项目编号无效，请先发送 /电费 项目")
-            return
-        if "空调" not in str(items.get(aid, "")):
-            yield event.plain_result(
-                "请先选择空调费项目（通常是 /电费 选择 1），绑定宿舍后会自动关联宿舍电费。"
-            )
-            return
-        try:
-            areas = await self.hjnu.list_areas(aid)
-        except SessionExpiredError:
-            yield event.plain_result(CREDENTIAL_HINT)
-            return
-        except QueryError as e:
-            yield event.plain_result(f"❌ {e}")
-            return
-        self._wizard[umo] = {"aid": aid, "areas": areas, "step": "area"}
-        lines = [f"🏫 {items.get(aid, aid)}的校区："]
-        lines.extend(f"{i}. {a.get('areaname')}（{a.get('area')}）" for i, a in enumerate(areas, 1))
-        lines.append("\n请选择校区：发送 /电费 校区 <编号>")
-        yield event.plain_result("\n".join(lines))
-
     @electric.command("校区")
     async def cmd_area(self, event: AstrMessageEvent, area_id: str | None = None):
         """选择缴费项目的校区"""
@@ -637,7 +628,7 @@ class DormElectricPlugin(Star):
         aid = wizard.get("aid")
         areas = wizard.get("areas") or []
         if not aid or not areas or area_id is None:
-            yield event.plain_result("用法：/电费 校区 <编号>（先 /电费 选择 <项目编号>）")
+            yield event.plain_result("用法：/电费 校区 <编号>（先 /电费 绑定 启动向导）")
             return
         try:
             area = areas[int(area_id) - 1]
@@ -730,8 +721,11 @@ class DormElectricPlugin(Star):
             return
         wizard["room"], wizard["step"] = room, "bind"
         lines = [
-            f"📍 已选择：{wizard['area'].get('areaname')}/{wizard['building'].get('building')}/"
-            f"{wizard['floor'].get('floor')}/{room.get('room')}",
+            (
+                f"📍 已选择：{wizard['area'].get('areaname')}/"
+                f"{wizard['building'].get('building')}/"
+                f"{wizard['floor'].get('floor')}/{room.get('room')}"
+            ),
             "",
             "确认绑定并同时查询空调费、宿舍电费？",
             "发送 /电费 绑定 1 确认。",
@@ -739,12 +733,53 @@ class DormElectricPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     @electric.command("绑定")
-    async def cmd_bind(self, event: AstrMessageEvent, room_id: str | None = None):
-        """绑定房间并开始监控"""
+    async def cmd_bind(self, event: AstrMessageEvent, confirm: str | None = None):
+        """启动绑定宿舍向导（无参）或确认绑定（带参 1）。"""
         umo = event.unified_msg_origin
+        items = self.config.get("fee_items", {}) or {}
+        if not items:
+            yield event.plain_result("配置中没有任何缴费项目（fee_items）。")
+            return
+
+        if confirm is None:
+            # 启动向导：取 fee_items 第 1 项 aid 作主线；老的 wizard 状态若不在新流程 step 列表中则重置
+            valid_steps = {"area", "building", "floor", "room", "bind"}
+            existing = self._wizard.get(umo) or {}
+            if existing.get("step") not in valid_steps:
+                self._wizard.pop(umo, None)
+            aid = next(iter(items))
+            try:
+                areas = await self.hjnu.list_areas(aid)
+            except SessionExpiredError:
+                yield event.plain_result(CREDENTIAL_HINT)
+                self._record_event(umo, "error", "绑定向导启动失败：凭证已失效")
+                return
+            except QueryError as e:
+                yield event.plain_result(f"❌ {e}")
+                self._record_event(umo, "error", f"绑定向导启动失败：{e}")
+                return
+            self._wizard[umo] = {"aid": aid, "areas": areas, "step": "area"}
+            lines = ["🏫 校区（" + str(items.get(aid, aid)) + "）："]
+            lines.extend(
+                f"{i}. {a.get('areaname')}（{a.get('area')}）"
+                for i, a in enumerate(areas, 1)
+            )
+            lines.append("\n下一步：/电费 校区 <编号>")
+            self._record_event(
+                umo, "info", f"绑定向导启动，主 aid={items.get(aid, aid)}"
+            )
+            yield event.plain_result("\n".join(lines))
+            return
+
         wizard = self._wizard.get(umo) or {}
-        if str(room_id) != "1" or wizard.get("step") != "bind" or not wizard.get("room"):
-            yield event.plain_result("请发送 /电费 绑定 1 确认当前选中的宿舍")
+        if (
+            str(confirm) != "1"
+            or wizard.get("step") != "bind"
+            or not wizard.get("room")
+        ):
+            yield event.plain_result(
+                "请先 /电费 绑定 启动向导，选好房间后再 /电费 绑定 1 确认"
+            )
             return
         room = wizard["room"]
         area, building = wizard["area"], wizard["building"]
@@ -754,8 +789,11 @@ class DormElectricPlugin(Star):
             f"{floor.get('floor')}/{room.get('room')}"
         )
         ac_params = {
-            "aid": wizard["aid"], "area": area, "building": building,
-            "floor": floor, "room": room,
+            "aid": wizard["aid"],
+            "area": area,
+            "building": building,
+            "floor": floor,
+            "room": room,
         }
         fees = {"ac": self._fee_entry("ac", ac_params)}
         elec = await self._match_elec_fee(ac_params)
@@ -770,8 +808,13 @@ class DormElectricPlugin(Star):
         self.store.set_binding(umo, binding)
         self.store.save()
         results = await self._fetch_fees(binding)
+        self._last_raw[umo] = {k: v.raw for k, v in results.items() if v is not None}
         lines = [f"✅ 绑定成功：{label}"]
-        lines.append("已自动关联宿舍电费房间" if "elec" in fees else "⚠️ 未自动关联宿舍电费")
+        lines.append(
+            "已自动关联宿舍电费房间"
+            if "elec" in fees
+            else "⚠️ 未自动关联宿舍电费（请检查 room token 是否在电费 aid 下也存在）"
+        )
         for kind, result in results.items():
             if result and result.ok and result.value is not None:
                 self.store.append_fee_history(
@@ -788,6 +831,11 @@ class DormElectricPlugin(Star):
                 lines.append(f"{self._fee_name(kind)}：查询失败：{result.raw}")
         lines.append("预警线：10；紧急线：5。轮询与预警已启用。")
         self.store.save()
+        self._record_event(
+            umo,
+            "info",
+            f"绑定成功：{label}（{'ac+elec' if 'elec' in fees else '仅 ac'}）",
+        )
         yield event.plain_result("\n".join(lines))
 
     @electric.command("解绑")
@@ -797,11 +845,12 @@ class DormElectricPlugin(Star):
         if self.store.del_binding(umo):
             self.store.save()
             self._wizard.pop(umo, None)
+            self._last_raw.pop(umo, None)
             yield event.plain_result("✅ 已解绑并停止监控。")
         else:
             yield event.plain_result("当前会话没有绑定。")
 
-    # ================= 指令：查询与登记 =================
+    # ================= 指令：查询 / 历史 / 日志 =================
 
     @electric.command("查询")
     async def cmd_query(self, event: AstrMessageEvent):
@@ -809,13 +858,16 @@ class DormElectricPlugin(Star):
         umo = event.unified_msg_origin
         binding = self.store.get_binding(umo)
         if not binding:
-            yield event.plain_result("尚未绑定房间。发送 /电费 项目 开始绑定。")
+            yield event.plain_result("尚未绑定房间。发送 /电费 绑定 开始。")
             return
         results = await self._fetch_fees(binding)
         if not results:
             yield event.plain_result("❌ 查询失败（网络异常或数据源不可用）。")
+            self._record_event(umo, "error", "查询失败：网络异常")
             return
+        self._last_raw[umo] = {k: v.raw for k, v in results.items() if v is not None}
         lines = [f"⚡ {self._binding_label(binding)}"]
+        ok_count = 0
         for kind, result in results.items():
             if result and result.ok and result.value is not None:
                 self.store.append_fee_history(
@@ -826,63 +878,101 @@ class DormElectricPlugin(Star):
                     keep_days=int(self._cfg("history_keep_days", 60)),
                 )
                 lines.append(self._fee_text(kind, result))
+                ok_count += 1
             elif result and result.session_expired:
                 lines.append(f"{self._fee_name(kind)}：凭证已失效")
             elif result:
                 lines.append(f"{self._fee_name(kind)}：查询失败：{result.raw}")
         self.store.save()
+        self._record_event(
+            umo,
+            "query",
+            f"查询成功 {ok_count}/{len(results)} 项（{self._binding_label(binding)}）",
+        )
         yield event.plain_result("\n".join(lines))
 
-    @electric.command("测试")
-    async def cmd_test(self, event: AstrMessageEvent):
-        """测试查询并显示接口原始返回"""
+    @electric.command("历史")
+    async def cmd_history(self, event: AstrMessageEvent, n: str | None = None):
+        """查看最近 n 条余额记录（默认 7，最多 60）"""
         umo = event.unified_msg_origin
         binding = self.store.get_binding(umo)
         if not binding:
-            yield event.plain_result("尚未绑定房间。")
-            return
-        results = await self._fetch_fees(binding)
-        lines = [f"网络：{'代理 ' + str(self._cfg('http_proxy')) if self._cfg('http_proxy', '') else '直连'}"]
-        for kind, result in results.items():
-            if result is None:
-                lines.append(f"{self._fee_name(kind)}：查询失败（网络异常）")
-                continue
-            lines.extend([
-                f"{self._fee_name(kind)}：ok={result.ok} value={result.value} {result.unit}",
-                f"原始：{result.raw}",
-            ])
-        yield event.plain_result("\n".join(lines))
-
-    @electric.command("登记")
-    async def cmd_manual(self, event: AstrMessageEvent, value: str | None = None):
-        """手动登记余额（无需学校凭证）"""
-        umo = event.unified_msg_origin
-        if value is None:
-            binding = self.store.get_binding(umo)
-            if binding and binding.get("manual_value") is not None:
-                yield event.plain_result(
-                    f"当前登记余额：{binding['manual_value']:g} 度\n更新：/电费 登记 <度数>"
-                )
-            else:
-                yield event.plain_result("用法：/电费 登记 <度数>，例如 /电费 登记 95.36")
+            yield event.plain_result("尚未绑定房间。发送 /电费 绑定 开始。")
             return
         try:
-            number = float(value)
+            count = int(n) if n else 7
         except ValueError:
-            yield event.plain_result("度数格式不对，例如：/电费 登记 95.36")
+            count = 7
+        count = max(1, min(60, count))
+        histories = binding.get("history_by_fee") or {}
+        if not histories:
+            yield event.plain_result("暂无历史数据。下次轮询后会自动记录。")
             return
-        binding = self.store.get_binding(umo) or {
-            "provider": "manual",
-            "room_label": event.get_sender_name(),
-        }
-        binding["provider"] = "manual"
-        binding["manual_value"] = number
-        binding["manual_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-        self.store.set_binding(umo, binding)
-        self.store.save()
-        yield event.plain_result(
-            f"✅ 已登记 {number:g} 度。\n低余额预警将基于此数值触发；建议每次查看电费后更新。"
-        )
+        lines = [f"📈 {self._binding_label(binding)} 历史"]
+        any_data = False
+        for kind in ("ac", "elec"):
+            history = histories.get(kind) or []
+            if not history:
+                continue
+            any_data = True
+            window = history[-count:]
+            lines.append(f"\n【{self._fee_name(kind)}】共 {len(history)} 条，展示最近 {len(window)} 条：")
+            for h in window:
+                ts = float(h["t"])
+                ago = (time.time() - ts) / 3600
+                when = (
+                    "刚刚"
+                    if ago < 1 / 60
+                    else f"{ago * 60:.0f} 分钟前"
+                    if ago < 1
+                    else f"{ago:.1f} 小时前"
+                    if ago < 24
+                    else f"{ago / 24:.1f} 天前"
+                )
+                lines.append(
+                    f"  {when}  {float(h['v']):.2f} {h.get('u', '度')}"
+                )
+            stats = self._history_stats(history)
+            if stats:
+                lines.append(
+                    f"  24h 用电：{stats['usage_24h']:.2f} {history[-1].get('u', '度')} | "
+                    f"日均：{stats['per_day']:.2f} | "
+                    f"最低：{stats['min']:.2f} / 最高：{stats['max']:.2f}"
+                )
+        if not any_data:
+            yield event.plain_result("暂无历史数据。下次轮询后会自动记录。")
+            return
+        self._record_event(umo, "info", f"查看历史（n={count}）")
+        yield event.plain_result("\n".join(lines))
+
+    @electric.command("日志")
+    async def cmd_log(self, event: AstrMessageEvent, n: str | None = None):
+        """查看最近 n 条事件 + 最近一次原始返回（默认 20，最多 100）"""
+        umo = event.unified_msg_origin
+        try:
+            count = int(n) if n else 20
+        except ValueError:
+            count = 20
+        count = max(1, min(100, count))
+        events = list(self._events)[-count:]
+        lines = [f"📋 事件流（最近 {len(events)} 条）："]
+        if not events:
+            lines.append("  （暂无事件）")
+        else:
+            for ev in events:
+                ts = float(ev.get("t", 0))
+                when = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+                kind = ev.get("kind", "?")
+                text = ev.get("text", "")
+                lines.append(f"  {when}  [{kind}] {text}")
+        raw = self._last_raw.get(umo) or {}
+        if raw:
+            lines.append("\n🔍 最近一次原始返回（按费种）：")
+            for kind, txt in raw.items():
+                lines.append(f"  [{self._fee_name(kind)}] {txt}")
+        else:
+            lines.append("\n🔍 最近一次原始返回：（无，先发 /电费 查询 触发一次）")
+        yield event.plain_result("\n".join(lines))
 
     # ================= 指令：凭证 =================
 
@@ -906,11 +996,14 @@ class DormElectricPlugin(Star):
             logger.warning(f"[{PLUGIN_NAME}] 保存配置失败：{e!r}")
         if self.hjnu:
             self.hjnu.update_cookie(text)
-        binding = self.store.get_binding(event.unified_msg_origin)
-        if binding and binding.get("provider") == "hjnu":
+        umo = event.unified_msg_origin
+        binding = self.store.get_binding(umo)
+        if binding:
             results = await self._fetch_fees(binding)
+            self._last_raw[umo] = {k: v.raw for k, v in results.items() if v is not None}
             lines = ["✅ 凭证已更新。"]
             lines.extend(self._format_fee_results(results))
+            self._record_event(umo, "credential", "凭证已更新")
             yield event.plain_result("\n".join(lines))
         else:
             yield event.plain_result("✅ 凭证已保存。")
