@@ -50,27 +50,6 @@ class Store:
     # ---------- 历史 ----------
 
     @staticmethod
-    def append_history(
-        binding: dict, value: float, ts: float | None = None, keep_days: int = 60
-    ) -> None:
-        ts = ts if ts is not None else time.time()
-        history = binding.setdefault("history", [])
-        history.append({"t": ts, "v": value})
-        cutoff = ts - 24 * 3600 * max(1, keep_days)
-        if len(history) > MAX_HISTORY:
-            del history[: len(history) - MAX_HISTORY]
-        binding["history"] = [h for h in history if h["t"] >= cutoff]
-
-    @staticmethod
-    def latest_value(binding: dict) -> tuple[float, float] | None:
-        """返回 (最新值, 时间戳)，无数据返回 None。"""
-        history = binding.get("history") or []
-        if not history:
-            return None
-        last = history[-1]
-        return float(last["v"]), float(last["t"])
-
-    @staticmethod
     def append_fee_history(
         binding: dict,
         fee: str,

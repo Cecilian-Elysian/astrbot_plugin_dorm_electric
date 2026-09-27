@@ -133,12 +133,16 @@ class HjnuProvider(ElecProvider):
                 try:
                     data = json.loads(text)
                 except ValueError as e:
+                    # 学校偶发「chunked 空页」抖动：200 但内容非 JSON，按瞬态故障重试
                     snippet = (text or "").strip()[:200]
+                    last_err = "接口返回的不是 JSON（可能凭证已被服务端作废）"
                     logger.error("电费接口返回非 JSON(%s)：%s", path, snippet)
-                    raise QueryError("接口返回的不是 JSON（可能凭证已被服务端作废）") from e
-                if not isinstance(data, dict):
-                    raise QueryError("接口返回了意外结构")
-                return data
+                    if attempt >= 2:
+                        raise QueryError(last_err) from e
+                else:
+                    if not isinstance(data, dict):
+                        raise QueryError("接口返回了意外结构")
+                    return data
             else:
                 snippet = (text or "").strip()[:200]
                 last_err = f"接口返回 HTTP {status}"

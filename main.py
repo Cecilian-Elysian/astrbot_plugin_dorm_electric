@@ -41,9 +41,8 @@ PLUGIN_NAME = "astrbot_plugin_dorm_electric"
 
 CREDENTIAL_HINT = (
     "🔐 学校系统凭证已失效或尚未配置。\n"
-    "请重新获取 JSESSIONID 后发送：/电费 凭证 JSESSIONID=xxxx\n"
-    "（获取方式：企业微信打开缴费查询页，用抓包工具复制请求头 Cookie；\n"
-    "期间也可用 /电费 登记 <度数> 手动记录余额）"
+    "重新获取 JSESSIONID 后私聊发送：/电费 凭证 JSESSIONID=xxxx\n"
+    "（获取方式：企业微信打开缴费查询页让 Cookie 入库，再用本地解密脚本提取，详见 README）"
 )
 
 DEFAULT_UA = (
@@ -63,7 +62,7 @@ def electric():
     PLUGIN_NAME,
     "Cecilian",
     "宿舍电费余额监控预警：低余额预警、每日播报、双费种同时查询",
-    "1.0.5",
+    "1.0.7",
 )
 class DormElectricPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -84,12 +83,12 @@ class DormElectricPlugin(Star):
         data_dir = Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME
         self.store = Store(
             data_dir / "history.json",
-            history_keep_days=int(self._cfg("history_keep_days", 60)),
+            history_keep_days=self._cfg_int("history_keep_days", 60),
         )
         self.hjnu = self._build_provider()
 
         self.scheduler = AsyncIOScheduler()
-        poll_min = max(0, int(self._cfg("poll_interval_minutes", 20)))
+        poll_min = self._cfg_int("poll_interval_minutes", 20)
         if poll_min:
             self.scheduler.add_job(
                 self._poll_all,
@@ -125,6 +124,9 @@ class DormElectricPlugin(Star):
                 logger.error(f"[{PLUGIN_NAME}] 保存数据失败：{e}")
         for t in self._tasks:
             t.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
         self._pending_alerts.clear()
 
     # ================= 工具方法 =================
@@ -138,6 +140,24 @@ class DormElectricPlugin(Star):
         if value is None or value == "":
             return default
         return value
+
+    def _cfg_int(self, key: str, default: int) -> int:
+        try:
+            return int(float(self.config.get(key, default)))
+        except (TypeError, ValueError):
+            return default
+
+    def _cfg_float(self, key: str, default: float) -> float:
+        try:
+            return float(self.config.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _cfg_bool(self, key: str, default: bool = False) -> bool:
+        value = self.config.get(key, default)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
 
     def _build_provider(self) -> HjnuProvider:
         return HjnuProvider(
@@ -156,7 +176,7 @@ class DormElectricPlugin(Star):
                     "http://pay2.hjnu.edu.cn/wechat/elecpay/queryelec.html",
                 )
             ),
-            timeout=int(self._cfg("request_timeout_seconds", 15)),
+            timeout=self._cfg_int("request_timeout_seconds", 15),
             proxy=str(self._cfg("http_proxy", "")),
         )
 
@@ -218,13 +238,33 @@ class DormElectricPlugin(Star):
             return None
 
     async def _fetch_fees(self, binding: dict) -> dict[str, object]:
-        results = {}
-        for kind, entry in self._fee_bindings(binding).items():
-            results[kind] = await self._fetch_entry(entry)
-        return results
+        entries = self._fee_bindings(binding)
+        keys = list(entries)
+        values = await asyncio.gather(*(self._fetch_entry(entries[k]) for k in keys))
+        return dict(zip(keys, values))
+
+    async def _query_and_record(self, umo: str, binding: dict) -> tuple[list[str], int]:
+        """查询全部费种并记录历史与原始返回；返回 (按费种格式化的行, 成功数)。"""
+        results = await self._fetch_fees(binding)
+        self._last_raw[umo] = {k: v.raw for k, v in results.items() if v is not None}
+        keep_days = self._cfg_int("history_keep_days", 60)
+        lines = []
+        ok_count = 0
+        for kind, result in results.items():
+            if result and result.ok and result.value is not None:
+                self.store.append_fee_history(
+                    binding, kind, result.value, result.unit, keep_days=keep_days
+                )
+                lines.append(self._fee_text(kind, result))
+                ok_count += 1
+            elif result and result.session_expired:
+                lines.append(f"{self._fee_name(kind)}：凭证已失效")
+            elif result:
+                lines.append(f"{self._fee_name(kind)}：查询失败：{result.raw}")
+        return lines, ok_count
 
     @staticmethod
-    def _fee_entry(kind: str, params: dict) -> dict:
+    def _fee_entry(params: dict) -> dict:
         return {"provider": "hjnu", "params": params}
 
     def _format_fee_results(self, results: dict[str, object]) -> list[str]:
@@ -292,23 +332,22 @@ class DormElectricPlugin(Star):
             )
             if not room:
                 return None
-            return {"provider": "hjnu", "params": {
+            return self._fee_entry({
                 "aid": elec_aid, "area": area, "building": building,
                 "floor": floor, "room": room,
-            }}
+            })
         except QueryError as e:
             logger.warning(f"[{PLUGIN_NAME}] 自动匹配宿舍电费房间失败：{e}")
             return None
 
-    async def _send(self, umo: str, text: str) -> None:
+    async def _send(self, umo: str, text: str) -> bool:
         try:
             chain = MessageChain().message(text)
             await self.context.send_message(umo, chain)
+            return True
         except Exception as e:
             logger.error(f"[{PLUGIN_NAME}] 推送失败到 {umo}: {e!r}")
-
-    def _provider_of(self, binding: dict):
-        return self.hjnu
+            return False
 
     async def _startup_poll(self):
         await asyncio.sleep(8)
@@ -323,10 +362,11 @@ class DormElectricPlugin(Star):
         """轮询所有 hjnu 绑定：更新历史、评估预警；顺带保活会话。"""
         if not self.store:
             return
+        keep_days = self._cfg_int("history_keep_days", 60)
         bindings = self.store.data.get("bindings", {})
         for umo, binding in list(bindings.items()):
-            for kind, entry in self._fee_bindings(binding).items():
-                result = await self._fetch_entry(entry)
+            results = await self._fetch_fees(binding)
+            for kind, result in results.items():
                 if result is None:
                     continue
                 if result.ok and result.value is not None:
@@ -335,7 +375,7 @@ class DormElectricPlugin(Star):
                         kind,
                         result.value,
                         result.unit,
-                        keep_days=int(self._cfg("history_keep_days", 60)),
+                        keep_days=keep_days,
                     )
                     await self._evaluate_alerts(
                         umo, binding, result.value, kind, result.unit
@@ -352,9 +392,9 @@ class DormElectricPlugin(Star):
         self, umo: str, binding: dict, value: float, kind: str = "ac", unit: str = "度"
     ):
         """评估预警：仅更新 state 与 pending_alerts，由 _flush_alerts 统一发送。"""
-        warn = float(self._cfg("threshold_warn", 10))
-        critical = float(self._cfg("threshold_critical", 5))
-        cooldown = float(self._cfg("alert_cooldown_hours", 24)) * 3600
+        warn = self._cfg_float("threshold_warn", 10)
+        critical = self._cfg_float("threshold_critical", 5)
+        cooldown = self._cfg_float("alert_cooldown_hours", 24) * 3600
         if critical > warn:
             warn, critical = critical, warn
         if value <= critical:
@@ -374,6 +414,18 @@ class DormElectricPlugin(Star):
 
         if level == 0:
             state["level"] = 0
+            if prev > 0 and self._cfg_bool("notify_recovery", False):
+                self._pending_alerts.setdefault(umo, []).append(
+                    {
+                        "kind": kind,
+                        "level": 0,
+                        "value": value,
+                        "unit": unit,
+                        "warn": warn,
+                        "critical": critical,
+                        "at": now,
+                    }
+                )
             return
         last_at = float(state.get("last_alert_at", {}).get(str(level), 0) or 0)
         need = level != prev or (now - last_at) >= cooldown
@@ -393,7 +445,6 @@ class DormElectricPlugin(Star):
         )
         state["level"] = level
         state.setdefault("last_alert_at", {})[str(level)] = now
-        self.store.save()
 
     async def _flush_alerts(self) -> None:
         """将本轮所有 pending 预警合并为单条消息发送。"""
@@ -405,20 +456,30 @@ class DormElectricPlugin(Star):
             binding = self.store.get_binding(umo) if self.store else None
             label = self._binding_label(binding) if binding else "未知房间"
             has_critical = any(i["level"] == 2 for i in items)
-            header = "🚨 余额预警" if has_critical else "⚠️ 余额预警"
+            has_recovery = all(i["level"] == 0 for i in items)
+            if has_critical:
+                header = "🚨 余额预警"
+            elif has_recovery:
+                header = "✅ 余额恢复"
+            else:
+                header = "⚠️ 余额预警"
             lines = [f"{header} | {label}"]
             for i in items:
                 if i["level"] == 2:
                     lines.append(
                         f"  {self._fee_name(i['kind'])}：{i['value']:.2f} {i['unit']}（≤ 紧急线 {i['critical']:g}）"
                     )
-                else:
+                elif i["level"] == 1:
                     lines.append(
                         f"  {self._fee_name(i['kind'])}：{i['value']:.2f} {i['unit']}（≤ 预警线 {i['warn']:g}）"
                     )
+                else:
+                    lines.append(
+                        f"  {self._fee_name(i['kind'])}：已恢复至 {i['value']:.2f} {i['unit']}"
+                    )
             if has_critical:
                 lines.append("请立即充值。")
-            else:
+            elif not has_recovery:
                 lines.append("建议尽快充值。")
             await self._send(umo, "\n".join(lines))
             self._record_event(
@@ -452,21 +513,17 @@ class DormElectricPlugin(Star):
         for umo, binding in list(bindings.items()):
             if binding.get("last_daily_date") == today:
                 continue
-            binding["last_daily_date"] = today
-            self.store.save()
             text = self._daily_text(binding)
-            if text:
-                await self._send(umo, text)
+            if not text:
+                continue
+            if await self._send(umo, text):
+                binding["last_daily_date"] = today
+                self.store.save()
                 self._record_event(umo, "info", f"每日播报已发送：{self._binding_label(binding)}")
 
     def _daily_text(self, binding: dict) -> str | None:
         label = self._binding_label(binding)
         histories = binding.get("history_by_fee") or {}
-        if not histories:
-            latest = self.store.latest_value(binding) if self.store else None
-            if latest is None:
-                return None
-            return f"☀️ 每日电费播报 | {label}\n空调费：{latest[0]:.2f} 度"
         lines = [f"☀️ 每日电费播报 | {label}"]
         for kind in ("ac", "elec"):
             history = histories.get(kind) or []
@@ -474,11 +531,37 @@ class DormElectricPlugin(Star):
                 continue
             value = float(history[-1]["v"])
             lines.append(f"{self._fee_name(kind)}：{value:.2f} {history[-1].get('u', '度')}")
-        return "\n".join(lines)
+        return "\n".join(lines) if len(lines) > 1 else None
+
+    @staticmethod
+    def _daily_snapshots(
+        history: list[dict], tz: timezone, days: int
+    ) -> list[tuple[Any, dict | None]]:
+        """按本地日期取「日末快照」：每天时间戳最大的一条记录。
+
+        返回从今天往前共 days 个自然日的 (date, 记录|None)，
+        最新日期在前，当天无记录的日期为 None。
+        """
+        by_date: dict[Any, dict] = {}
+        for h in history:
+            d = datetime.fromtimestamp(float(h["t"]), tz).date()
+            prev = by_date.get(d)
+            if prev is None or float(h["t"]) >= float(prev["t"]):
+                by_date[d] = h
+        today = datetime.now(tz).date()
+        snapshots: list[tuple[Any, dict | None]] = []
+        for i in range(days):
+            d = today - timedelta(days=i)
+            snapshots.append((d, by_date.get(d)))
+        return snapshots
 
     @staticmethod
     def _history_stats(history: list[dict]) -> dict | None:
-        """计算 24h 用电、日均、最低/最高。"""
+        """计算 24h 用电、24h 充值、日均、最低/最高。
+
+        余额序列中下降段计为用电、上升段计为充值，避免中途充值
+        导致用电量被低估甚至算成 0。
+        """
         if len(history) < 1:
             return None
         values = [float(h["v"]) for h in history]
@@ -488,28 +571,37 @@ class DormElectricPlugin(Star):
         min_v = min(values)
         max_v = max(values)
 
-        # 24h 用电：找最接近 (now-24h) 时刻的样本差值
-        ref = history[0]
-        for h in history:
+        # 24h 窗口：起点为最接近 (now-24h) 时刻的样本
+        start = 0
+        for i, h in enumerate(history):
             if now - float(h["t"]) >= 24 * 3600:
-                ref = h
+                start = i
             else:
                 break
-        usage_24h = float(ref["v"]) - values[-1]
-        if usage_24h < 0:
-            usage_24h = 0.0
+        usage_24h = 0.0
+        recharged_24h = 0.0
+        for i in range(start + 1, len(history)):
+            delta = values[i - 1] - values[i]
+            if delta > 0:
+                usage_24h += delta
+            else:
+                recharged_24h += -delta
 
-        # 日均：按全历史跨度
+        # 日均：按全历史跨度的下降段之和
         span_days = (ts[-1] - ts[0]) / 86400
-        per_day = None
+        per_day = 0.0
         if span_days >= 0.5 and len(history) >= 2:
-            drop = values[0] - values[-1]
-            if drop > 0:
-                per_day = drop / span_days
+            total_usage = 0.0
+            for i in range(1, len(history)):
+                delta = values[i - 1] - values[i]
+                if delta > 0:
+                    total_usage += delta
+            per_day = total_usage / span_days
 
         return {
             "usage_24h": usage_24h,
-            "per_day": per_day if per_day is not None else 0.0,
+            "recharged_24h": recharged_24h,
+            "per_day": per_day,
             "min": min_v,
             "max": max_v,
             "unit": unit,
@@ -521,44 +613,13 @@ class DormElectricPlugin(Star):
             {"t": time.time(), "kind": kind, "text": text, "umo": umo}
         )
 
-    @staticmethod
-    def _usage_since(binding: dict, hours: float) -> float | None:
-        """估算近 N 小时用电量：最早一条与最新一条的差值。"""
-        history = binding.get("history") or []
-        if len(history) < 2:
-            return None
-        now = time.time()
-        old_ref = None
-        for h in history:
-            if now - float(h["t"]) >= hours * 3600:
-                old_ref = h
-            else:
-                break
-        if old_ref is None:
-            old_ref = history[0]
-        usage = float(old_ref["v"]) - float(history[-1]["v"])
-        return usage if usage > 0 else 0.0
-
-    @staticmethod
-    def _estimate_days(binding: dict, value: float) -> tuple[float | None, float | None]:
-        """按全部历史平均日用电估算可用天数。"""
-        history = binding.get("history") or []
-        if len(history) < 2:
-            return None, None
-        span_days = (float(history[-1]["t"]) - float(history[0]["t"])) / 86400
-        if span_days < 0.5:
-            return None, None
-        drop = float(history[0]["v"]) - float(history[-1]["v"])
-        if drop <= 0:
-            return None, None
-        per_day = drop / span_days
-        return value / per_day, per_day
-
     # ================= 指令：帮助与状态 =================
 
     @electric.command("帮助", alias={"help"})
     async def cmd_help(self, event: AstrMessageEvent):
         """查看指令帮助"""
+        warn = self._cfg_float("threshold_warn", 10)
+        critical = self._cfg_float("threshold_critical", 5)
         yield event.plain_result(
             "⚡ 宿舍电费监控指令：\n"
             "/电费 绑定 — 启动绑定宿舍向导（自动同时关联空调费 + 宿舍电费）\n"
@@ -566,11 +627,11 @@ class DormElectricPlugin(Star):
             "/电费 绑定 1 — 确认绑定\n"
             "/电费 解绑 — 取消监控\n"
             "/电费 查询 — 同时查询空调费和宿舍电费\n"
-            "/电费 凭证 <JSESSIONID=...> — 更新会话凭证（热更新，无需重启）\n"
-            "/电费 历史 [n] — 查看最近 n 条余额记录（默认 7，最多 60）\n"
+            "/电费 凭证 <JSESSIONID=...> — 更新会话凭证（仅限私聊，热更新）\n"
+            "/电费 历史 [n] — 查看最近 n 天每日余额（默认 7 天，最多 60 天）\n"
             "/电费 日志 [n] — 查看最近 n 条事件 + 最近一次原始返回（默认 20，最多 100）\n"
             "/电费 状态 — 查看绑定与运行状态\n"
-            "预警线：10；紧急线：5（空调费单位为度，宿舍电费单位为元）"
+            f"预警线：{warn:g}；紧急线：{critical:g}（空调费单位为度，宿舍电费单位为元）"
         )
 
     @electric.command("状态")
@@ -588,8 +649,8 @@ class DormElectricPlugin(Star):
                 f"（{self._cfg('daily_timezone', 'Asia/Shanghai')}）"
             ),
             (
-                f"预警线：{self._cfg('threshold_warn', 10):g} / 紧急 "
-                f"{self._cfg('threshold_critical', 5):g}（空调费为度，宿舍电费为元）"
+                f"预警线：{self._cfg_float('threshold_warn', 10):g} / 紧急 "
+                f"{self._cfg_float('threshold_critical', 5):g}（空调费为度，宿舍电费为元）"
             ),
         ]
         if not binding:
@@ -607,11 +668,6 @@ class DormElectricPlugin(Star):
                         f"{self._fee_name(kind)}：{float(latest['v']):.2f} "
                         f"{latest.get('u', '度')}（{ago:.0f} 分钟前）"
                     )
-            if not binding.get("history_by_fee"):
-                latest = self.store.latest_value(binding)
-                if latest:
-                    ago = (time.time() - latest[1]) / 60
-                    lines.append(f"空调费：{latest[0]:.2f} 度（{ago:.0f} 分钟前）")
         yield event.plain_result("\n".join(lines))
 
     # ================= 指令：绑定向导 =================
@@ -667,6 +723,7 @@ class DormElectricPlugin(Star):
             floors = await self.hjnu.list_floors(wizard["aid"], wizard["area"], building)
         except SessionExpiredError:
             yield event.plain_result(CREDENTIAL_HINT)
+            return
         except QueryError as e:
             yield event.plain_result(f"❌ {e}")
             return
@@ -696,6 +753,7 @@ class DormElectricPlugin(Star):
             )
         except SessionExpiredError:
             yield event.plain_result(CREDENTIAL_HINT)
+            return
         except QueryError as e:
             yield event.plain_result(f"❌ {e}")
             return
@@ -795,7 +853,7 @@ class DormElectricPlugin(Star):
             "floor": floor,
             "room": room,
         }
-        fees = {"ac": self._fee_entry("ac", ac_params)}
+        fees = {"ac": self._fee_entry(ac_params)}
         elec = await self._match_elec_fee(ac_params)
         if elec:
             fees["elec"] = elec
@@ -806,30 +864,18 @@ class DormElectricPlugin(Star):
             "fees": fees,
         }
         self.store.set_binding(umo, binding)
-        self.store.save()
-        results = await self._fetch_fees(binding)
-        self._last_raw[umo] = {k: v.raw for k, v in results.items() if v is not None}
+        fee_lines, _ = await self._query_and_record(umo, binding)
         lines = [f"✅ 绑定成功：{label}"]
         lines.append(
             "已自动关联宿舍电费房间"
             if "elec" in fees
             else "⚠️ 未自动关联宿舍电费（请检查 room token 是否在电费 aid 下也存在）"
         )
-        for kind, result in results.items():
-            if result and result.ok and result.value is not None:
-                self.store.append_fee_history(
-                    binding,
-                    kind,
-                    result.value,
-                    result.unit,
-                    keep_days=int(self._cfg("history_keep_days", 60)),
-                )
-                lines.append(self._fee_text(kind, result))
-            elif result and result.session_expired:
-                lines.append(f"{self._fee_name(kind)}：凭证已失效")
-            elif result:
-                lines.append(f"{self._fee_name(kind)}：查询失败：{result.raw}")
-        lines.append("预警线：10；紧急线：5。轮询与预警已启用。")
+        lines.extend(fee_lines)
+        lines.append(
+            f"预警线：{self._cfg_float('threshold_warn', 10):g}；"
+            f"紧急线：{self._cfg_float('threshold_critical', 5):g}。轮询与预警已启用。"
+        )
         self.store.save()
         self._record_event(
             umo,
@@ -860,89 +906,88 @@ class DormElectricPlugin(Star):
         if not binding:
             yield event.plain_result("尚未绑定房间。发送 /电费 绑定 开始。")
             return
-        results = await self._fetch_fees(binding)
-        if not results:
-            yield event.plain_result("❌ 查询失败（网络异常或数据源不可用）。")
+        fee_lines, ok_count = await self._query_and_record(umo, binding)
+        total = len(self._fee_bindings(binding))
+        if not fee_lines:
+            yield event.plain_result(
+                f"⚡ {self._binding_label(binding)}\n❌ 查询失败（网络异常或数据源不可用）。"
+            )
             self._record_event(umo, "error", "查询失败：网络异常")
             return
-        self._last_raw[umo] = {k: v.raw for k, v in results.items() if v is not None}
-        lines = [f"⚡ {self._binding_label(binding)}"]
-        ok_count = 0
-        for kind, result in results.items():
-            if result and result.ok and result.value is not None:
-                self.store.append_fee_history(
-                    binding,
-                    kind,
-                    result.value,
-                    result.unit,
-                    keep_days=int(self._cfg("history_keep_days", 60)),
-                )
-                lines.append(self._fee_text(kind, result))
-                ok_count += 1
-            elif result and result.session_expired:
-                lines.append(f"{self._fee_name(kind)}：凭证已失效")
-            elif result:
-                lines.append(f"{self._fee_name(kind)}：查询失败：{result.raw}")
         self.store.save()
         self._record_event(
             umo,
             "query",
-            f"查询成功 {ok_count}/{len(results)} 项（{self._binding_label(binding)}）",
+            f"查询成功 {ok_count}/{total} 项（{self._binding_label(binding)}）",
         )
-        yield event.plain_result("\n".join(lines))
+        yield event.plain_result(
+            f"⚡ {self._binding_label(binding)}\n" + "\n".join(fee_lines)
+        )
 
     @electric.command("历史")
     async def cmd_history(self, event: AstrMessageEvent, n: str | None = None):
-        """查看最近 n 条余额记录（默认 7，最多 60）"""
+        """查看最近 n 天每日余额快照（默认 7 天，最多 60 天）"""
         umo = event.unified_msg_origin
         binding = self.store.get_binding(umo)
         if not binding:
             yield event.plain_result("尚未绑定房间。发送 /电费 绑定 开始。")
             return
         try:
-            count = int(n) if n else 7
+            days = int(n) if n else 7
         except ValueError:
-            count = 7
-        count = max(1, min(60, count))
+            days = 7
+        days = max(1, min(60, days))
+        tz = self._resolve_tz(self._cfg("daily_timezone", "Asia/Shanghai"))
         histories = binding.get("history_by_fee") or {}
         if not histories:
             yield event.plain_result("暂无历史数据。下次轮询后会自动记录。")
             return
-        lines = [f"📈 {self._binding_label(binding)} 历史"]
+        lines = [f"📈 {self._binding_label(binding)} 历史（近 {days} 天）"]
         any_data = False
         for kind in ("ac", "elec"):
             history = histories.get(kind) or []
             if not history:
                 continue
             any_data = True
-            window = history[-count:]
-            lines.append(f"\n【{self._fee_name(kind)}】共 {len(history)} 条，展示最近 {len(window)} 条：")
-            for h in window:
-                ts = float(h["t"])
-                ago = (time.time() - ts) / 3600
-                when = (
-                    "刚刚"
-                    if ago < 1 / 60
-                    else f"{ago * 60:.0f} 分钟前"
-                    if ago < 1
-                    else f"{ago:.1f} 小时前"
-                    if ago < 24
-                    else f"{ago / 24:.1f} 天前"
-                )
-                lines.append(
-                    f"  {when}  {float(h['v']):.2f} {h.get('u', '度')}"
-                )
+            # _daily_snapshots 最新在前；按时间正序逐日成行后倒序展示，
+            # 与更早最近的可用日末快照求差：下降=用电、上升=充值
+            snaps = self._daily_snapshots(history, tz, days)
+            today = snaps[0][0]
+            chron = list(reversed(snaps))
+            row_lines: list[str] = []
+            prev: dict | None = None
+            for date, rec in chron:
+                label = date.strftime("%m-%d") + ("（今天）" if date == today else "")
+                if rec is None:
+                    row_lines.append(f"  {label}  无记录")
+                    continue
+                row = f"  {label}  {float(rec['v']):.2f} {rec.get('u', '度')}"
+                if prev is not None:
+                    delta = float(prev["v"]) - float(rec["v"])
+                    if delta > 0:
+                        row += f"（-{delta:.2f}）"
+                    elif delta < 0:
+                        row += f"（充值 +{-delta:.2f}）"
+                    else:
+                        row += "（持平）"
+                row_lines.append(row)
+                prev = rec
+            lines.append(f"\n【{self._fee_name(kind)}】每日余额：")
+            lines.extend(reversed(row_lines))
             stats = self._history_stats(history)
             if stats:
+                extra = ""
+                if stats["recharged_24h"] > 0:
+                    extra = f" | 检测到充值 +{stats['recharged_24h']:.2f}"
                 lines.append(
                     f"  24h 用电：{stats['usage_24h']:.2f} {history[-1].get('u', '度')} | "
                     f"日均：{stats['per_day']:.2f} | "
-                    f"最低：{stats['min']:.2f} / 最高：{stats['max']:.2f}"
+                    f"最低：{stats['min']:.2f} / 最高：{stats['max']:.2f}{extra}"
                 )
         if not any_data:
             yield event.plain_result("暂无历史数据。下次轮询后会自动记录。")
             return
-        self._record_event(umo, "info", f"查看历史（n={count}）")
+        self._record_event(umo, "info", f"查看历史（近 {days} 天）")
         yield event.plain_result("\n".join(lines))
 
     @electric.command("日志")
@@ -954,14 +999,15 @@ class DormElectricPlugin(Star):
         except ValueError:
             count = 20
         count = max(1, min(100, count))
-        events = list(self._events)[-count:]
+        tz = self._resolve_tz(self._cfg("daily_timezone", "Asia/Shanghai"))
+        events = [ev for ev in self._events if ev.get("umo") == umo][-count:]
         lines = [f"📋 事件流（最近 {len(events)} 条）："]
         if not events:
             lines.append("  （暂无事件）")
         else:
             for ev in events:
                 ts = float(ev.get("t", 0))
-                when = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+                when = datetime.fromtimestamp(ts, tz).strftime("%H:%M:%S")
                 kind = ev.get("kind", "?")
                 text = ev.get("text", "")
                 lines.append(f"  {when}  [{kind}] {text}")
@@ -978,12 +1024,17 @@ class DormElectricPlugin(Star):
 
     @electric.command("凭证")
     async def cmd_credential(self, event: AstrMessageEvent, credential: str | None = None):
-        """更新缴费系统会话凭证（JSESSIONID）"""
+        """更新缴费系统会话凭证（JSESSIONID，仅限私聊）"""
+        if not event.is_private_chat():
+            yield event.plain_result(
+                "🔒 凭证是全局会话密钥，请私聊机器人发送 /电费 凭证 更新。"
+            )
+            return
         if not credential:
             yield event.plain_result(
                 "用法：/电费 凭证 JSESSIONID=xxxx\n"
-                "获取方式：在企业微信打开缴电费页面，用抓包工具复制请求头中的 "
-                "Cookie 值（整段粘贴即可）。"
+                "获取方式：在企业微信打开缴电费页面让 Cookie 入库，"
+                "再用 README 提供的本地解密脚本提取（无需抓包）。"
             )
             return
         text = credential.strip()
