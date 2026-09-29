@@ -39,10 +39,15 @@ except ImportError:
 
 PLUGIN_NAME = "astrbot_plugin_dorm_electric"
 
+# 绑定向导里每页显示的房间数。房间多时用 /电费 房间 翻页、/电费 房间 p2 跳页，
+# 选择时仍用全楼层绝对编号，避免超过一页的房间选不到。
+ROOM_PAGE_SIZE = 30
+
 CREDENTIAL_HINT = (
     "🔐 学校系统凭证已失效或尚未配置。\n"
     "重新获取 JSESSIONID 后私聊发送：/电费 凭证 JSESSIONID=xxxx\n"
-    "（获取方式：企业微信打开缴费查询页让 Cookie 入库，再用本地解密脚本提取，详见 README）"
+    "（获取方式：企业微信打开缴费查询页让 Cookie 入库，再运行仓库内 "
+    "tools/extract_cookie.py 提取，详见 README）"
 )
 
 DEFAULT_UA = (
@@ -62,7 +67,7 @@ def electric():
     PLUGIN_NAME,
     "Cecilian",
     "宿舍电费余额监控预警：低余额预警、每日播报、双费种同时查询",
-    "1.0.7",
+    "1.0.8",
 )
 class DormElectricPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -243,10 +248,16 @@ class DormElectricPlugin(Star):
         values = await asyncio.gather(*(self._fetch_entry(entries[k]) for k in keys))
         return dict(zip(keys, values))
 
+    def _remember_raw(self, umo: str, results: dict[str, object]) -> None:
+        """保存最近一次查询的原始返回，供 /电费 日志 展示（按会话隔离）。"""
+        raw = {k: v.raw for k, v in results.items() if v is not None}
+        if raw:
+            self._last_raw[umo] = raw
+
     async def _query_and_record(self, umo: str, binding: dict) -> tuple[list[str], int]:
         """查询全部费种并记录历史与原始返回；返回 (按费种格式化的行, 成功数)。"""
         results = await self._fetch_fees(binding)
-        self._last_raw[umo] = {k: v.raw for k, v in results.items() if v is not None}
+        self._remember_raw(umo, results)
         keep_days = self._cfg_int("history_keep_days", 60)
         lines = []
         ok_count = 0
@@ -283,6 +294,21 @@ class DormElectricPlugin(Star):
     @staticmethod
     def _fee_text(kind: str, result) -> str:
         return f"{DormElectricPlugin._fee_name(kind)}：{result.value:.2f} {result.unit}"
+
+    @staticmethod
+    def _room_page(
+        rooms: list, page: int, page_size: int = ROOM_PAGE_SIZE
+    ) -> tuple[int, int, int]:
+        """房间列表分页：返回 (起始下标, 结束下标, 总页数)，页码自动夹到有效范围。"""
+        total = len(rooms)
+        total_pages = max(1, -(-total // page_size))
+        try:
+            page = int(page)
+        except (TypeError, ValueError):
+            page = 1
+        page = max(1, min(total_pages, page))
+        start = (page - 1) * page_size
+        return start, min(start + page_size, total), total_pages
 
     @staticmethod
     def _room_token(room_name: str) -> str | None:
@@ -366,6 +392,7 @@ class DormElectricPlugin(Star):
         bindings = self.store.data.get("bindings", {})
         for umo, binding in list(bindings.items()):
             results = await self._fetch_fees(binding)
+            self._remember_raw(umo, results)
             for kind, result in results.items():
                 if result is None:
                     continue
@@ -623,7 +650,9 @@ class DormElectricPlugin(Star):
         yield event.plain_result(
             "⚡ 宿舍电费监控指令：\n"
             "/电费 绑定 — 启动绑定宿舍向导（自动同时关联空调费 + 宿舍电费）\n"
-            "/电费 校区/楼栋/楼层/房间 <编号> — 逐级选择宿舍\n"
+            "/电费 校区/楼栋/楼层 <编号> — 逐级选择宿舍\n"
+            "/电费 房间 — 浏览房间列表（无参翻页，p<页码> 跳页）\n"
+            "/电费 房间 <编号> — 按全楼层绝对编号选择房间\n"
             "/电费 绑定 1 — 确认绑定\n"
             "/电费 解绑 — 取消监控\n"
             "/电费 查询 — 同时查询空调费和宿舍电费\n"
@@ -758,36 +787,94 @@ class DormElectricPlugin(Star):
             yield event.plain_result(f"❌ {e}")
             return
         wizard["floor"], wizard["rooms"], wizard["step"] = floor, rooms, "room"
-        lines = ["🚪 房间列表（前 60 个）："]
-        lines.extend(f"{i}. {r.get('room')}（{r.get('roomid')}）" for i, r in enumerate(rooms[:60], 1))
-        lines.append("\n请选择房间：发送 /电费 房间 <编号>")
+        # 0 = 还没显示过任何页，下一次 /电费 房间 无参才展示第 1 页
+        wizard["room_page"] = 0
+        total = len(rooms)
+        _, _, total_pages = self._room_page(rooms, 1)
+        lines = [
+            f"🧱 {floor.get('floor')}：共 {total} 间"
+            + (f"，分 {total_pages} 页显示" if total_pages > 1 else "")
+        ]
+        lines.append("\n查看房间列表：发送 /电费 房间（无参数即为第 1 页）")
         yield event.plain_result("\n".join(lines))
 
     @electric.command("房间")
     async def cmd_room(self, event: AstrMessageEvent, room_no: str | None = None):
-        """列出房间"""
+        """浏览房间列表（无参翻页、p<页码>跳页）或按绝对编号选择房间"""
         umo = event.unified_msg_origin
         wizard = self._wizard.get(umo) or {}
         rooms = wizard.get("rooms") or []
-        if room_no is None or not rooms:
-            yield event.plain_result("用法：/电费 房间 <编号>（先 /电费 楼层）")
+        if not rooms:
+            yield event.plain_result("用法：/电费 房间 [编号]（先 /电费 楼层）")
             return
-        try:
-            room = rooms[int(room_no) - 1]
-        except (ValueError, IndexError):
-            yield event.plain_result("房间编号无效")
+        # AstrBot 可能把纯数字参数转成 int，统一按字符串处理
+        token = str(room_no).strip() if room_no is not None else ""
+
+        if token[:1] in ("p", "P") and token[1:].isdigit():
+            page = int(token[1:])
+            wrapped = False
+        elif token.isdigit():
+            index = int(token) - 1
+            if not 0 <= index < len(rooms):
+                yield event.plain_result(
+                    f"房间编号无效：本层共 {len(rooms)} 间，有效编号 1-{len(rooms)}"
+                )
+                return
+            room = rooms[index]
+            wizard["room"], wizard["step"] = room, "bind"
+            yield event.plain_result(
+                "\n".join(
+                    [
+                        (
+                            f"📍 已选择：{wizard['area'].get('areaname')}/"
+                            f"{wizard['building'].get('building')}/"
+                            f"{wizard['floor'].get('floor')}/{room.get('room')}"
+                        ),
+                        "",
+                        "确认绑定并同时查询空调费、宿舍电费？",
+                        "发送 /电费 绑定 1 确认。",
+                    ]
+                )
+            )
             return
-        wizard["room"], wizard["step"] = room, "bind"
+        elif token:
+            yield event.plain_result(
+                f"无法识别的参数「{token}」。\n"
+                "用法：/电费 房间（翻页）、/电费 房间 p<页码>（跳页）、"
+                "/电费 房间 <编号>（选择，绝对编号）"
+            )
+            return
+        else:
+            _, _, total_pages = self._room_page(rooms, 1)
+            if total_pages == 1:
+                page, wrapped = 1, False
+            else:
+                page = int(wizard.get("room_page") or 0) + 1
+                wrapped = page > total_pages
+                if wrapped:
+                    page = 1
+
+        start, end, total_pages = self._room_page(rooms, page)
+        wizard["room_page"] = page
+        where = f"{wizard.get('building', {}).get('building')} / {wizard.get('floor', {}).get('floor')}"
         lines = [
-            (
-                f"📍 已选择：{wizard['area'].get('areaname')}/"
-                f"{wizard['building'].get('building')}/"
-                f"{wizard['floor'].get('floor')}/{room.get('room')}"
-            ),
-            "",
-            "确认绑定并同时查询空调费、宿舍电费？",
-            "发送 /电费 绑定 1 确认。",
+            f"🚪 房间列表（{where}）",
+            f"第 {page}/{total_pages} 页 · 本页第 {start + 1}-{end} 间（全楼层共 {len(rooms)} 间）",
         ]
+        if wrapped:
+            lines.append("（已到末页，回到第 1 页）")
+        lines.append("")
+        lines.extend(
+            f"{i}. {r.get('room')}（{r.get('roomid')}）"
+            for i, r in enumerate(rooms[start:end], start + 1)
+        )
+        lines.append("")
+        if total_pages > 1:
+            lines.append(
+                "翻页：/电费 房间　　跳页：/电费 房间 p<页码>　　选择：/电费 房间 <编号>"
+            )
+        else:
+            lines.append("选择：/电费 房间 <编号>")
         yield event.plain_result("\n".join(lines))
 
     @electric.command("绑定")
@@ -1051,7 +1138,7 @@ class DormElectricPlugin(Star):
         binding = self.store.get_binding(umo)
         if binding:
             results = await self._fetch_fees(binding)
-            self._last_raw[umo] = {k: v.raw for k, v in results.items() if v is not None}
+            self._remember_raw(umo, results)
             lines = ["✅ 凭证已更新。"]
             lines.extend(self._format_fee_results(results))
             self._record_event(umo, "credential", "凭证已更新")
