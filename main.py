@@ -1,6 +1,6 @@
 """宿舍电费余额监控预警插件。
 
-- /电费 指令组：绑定宿舍向导、查询、状态、凭证、历史、日志
+- /电费 指令组：绑定宿舍向导、查询、状态、凭证、历史、日志、自检
 - 定时轮询余额 → 低余额/紧急预警（含冷却），预警按会话合并为单条消息
 - 轮询同时保活学校缴费系统会话凭证
 - 每日定时播报：当前余额（两种费种）
@@ -67,7 +67,7 @@ def electric():
     PLUGIN_NAME,
     "Cecilian",
     "宿舍电费余额监控预警：低余额预警、每日播报、双费种同时查询",
-    "1.0.8",
+    "1.0.9",
 )
 class DormElectricPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -278,11 +278,22 @@ class DormElectricPlugin(Star):
     def _fee_entry(params: dict) -> dict:
         return {"provider": "hjnu", "params": params}
 
-    def _format_fee_results(self, results: dict[str, object]) -> list[str]:
+    def _format_fee_results(
+        self, results: dict[str, object], include_missing: bool = False
+    ) -> list[str]:
+        """把查询结果格式化成按费种分行的文本。
+
+        include_missing=True 时把「连响应都没有」（网络/学校 5xx）的费种也列出来，
+        /电费 检查 用它来避免明细整段空白、看不出是哪一路失败。
+        """
         lines = []
         for kind in ("ac", "elec"):
             result = results.get(kind)
             if result is None:
+                if include_missing:
+                    lines.append(
+                        f"{self._fee_name(kind)}：❌ 未取到响应（网络异常或学校无响应）"
+                    )
                 continue
             if result.ok and result.value is not None:
                 lines.append(self._fee_text(kind, result))
@@ -660,6 +671,7 @@ class DormElectricPlugin(Star):
             "/电费 历史 [n] — 查看最近 n 天每日余额（默认 7 天，最多 60 天）\n"
             "/电费 日志 [n] — 查看最近 n 条事件 + 最近一次原始返回（默认 20，最多 100）\n"
             "/电费 状态 — 查看绑定与运行状态\n"
+            "/电费 检查 — 自检：凭证是否生效 + 绑定是否正确 + 余额能否查到\n"
             f"预警线：{warn:g}；紧急线：{critical:g}（空调费单位为度，宿舍电费单位为元）"
         )
 
@@ -697,6 +709,91 @@ class DormElectricPlugin(Star):
                         f"{self._fee_name(kind)}：{float(latest['v']):.2f} "
                         f"{latest.get('u', '度')}（{ago:.0f} 分钟前）"
                     )
+        yield event.plain_result("\n".join(lines))
+
+    # ================= 指令：自检 =================
+
+    @staticmethod
+    def _credential_state(results: dict) -> str:
+        """由一次真实查询的结果判定凭证状态（供 /电费 检查 与 /电费 状态 复用）。
+
+        判定顺序很重要：先看有没有取到余额（说明学校认这个会话），
+        再看是不是 91001（学校明确拒绝），最后才是网络/学校抖动——
+        反过来会把学校夜间故障误报成「凭证过期」，害用户白折腾一轮重新提取。
+        """
+        values = list(results.values())
+        ok = [r for r in values if r is not None and r.ok and r.value is not None]
+        expired = [r for r in values if r is not None and r.session_expired]
+        if not values:
+            return "⚠️ 绑定里没有任何费种参数，请重新 /电费 绑定"
+        if ok:
+            if expired:
+                return "⚠️ 仅部分费种可用（详见下方明细）"
+            return "✅ 有效（学校接口已接受本次查询）"
+        if expired:
+            return "⚠️ 学校已拒绝（retcode 91001 会话超时），需重新提取 JSESSIONID"
+        if all(r is None for r in values):
+            return "⚠️ 学校接口不可用（网络异常或学校无响应），凭证状态未知，请稍后 /电费 查询 重试"
+        return "⚠️ 学校有响应但未取到余额（见下方明细与 /电费 日志 的原始返回）"
+
+    @electric.command("检查", alias={"自检"})
+    async def cmd_check(self, event: AstrMessageEvent):
+        """一次性自检：凭证是否生效、绑定是否正确、余额能否查到"""
+        umo = event.unified_msg_origin
+        binding = self.store.get_binding(umo) if self.store else None
+        label = self._binding_label(binding) if binding else ""
+
+        if not str(self.config.get("hjnu_cookie", "") or "").strip():
+            bound_line = (
+                f"绑定：✅ {label}" if binding else "绑定：❌ 未绑定（/电费 绑定 开始）"
+            )
+            yield event.plain_result(
+                "🔎 电费自检\n"
+                "凭证：❌ 未配置（私聊发送 /电费 凭证 JSESSIONID=xxxx）\n"
+                f"{bound_line}"
+            )
+            return
+
+        if not binding:
+            yield event.plain_result(
+                "🔎 电费自检\n"
+                "凭证：✅ 已配置（尚未验证，绑定后可验证）\n"
+                "绑定：❌ 未绑定（/电费 绑定 开始）"
+            )
+            return
+
+        results = await self._fetch_fees(binding)
+        self._remember_raw(umo, results)
+        state = self._credential_state(results)
+        fees = self._fee_bindings(binding)
+        lines = [
+            f"🔎 电费自检 {label}",
+            f"凭证：{state}",
+            "绑定：✅ "
+            + label
+            + "（已关联："
+            + "、".join(self._fee_name(kind) for kind in fees)
+            + "）",
+            "实时查询：",
+        ]
+        lines.extend(
+            "  " + line
+            for line in self._format_fee_results(results, include_missing=True)
+        )
+        events = [ev for ev in self._events if ev.get("umo") == umo][-5:]
+        lines.append("最近事件（新→旧）：")
+        if not events:
+            lines.append("  （暂无事件）")
+        else:
+            tz = self._resolve_tz(self._cfg("daily_timezone", "Asia/Shanghai"))
+            for ev in reversed(events):
+                when = datetime.fromtimestamp(float(ev.get("t", 0)), tz).strftime(
+                    "%H:%M:%S"
+                )
+                lines.append(
+                    f"  {when}  [{ev.get('kind', '?')}] {ev.get('text', '')}"
+                )
+        self._record_event(umo, "info", f"自检：{state.split('（')[0]}")
         yield event.plain_result("\n".join(lines))
 
     # ================= 指令：绑定向导 =================
