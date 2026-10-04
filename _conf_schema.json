@@ -96,5 +96,23 @@
     "description": "历史数据保留天数",
     "type": "int",
     "default": 60
+  },
+  "ai_tools_enabled": {
+    "description": "启用 AI 对话工具",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后 AI 调用电费工具会直接回「已被插件配置关闭」。群聊只读、绑定/解绑/改绑一律需私聊并在 WebUI 的「插件 → 管理行为 → 函数工具」里启用这些工具（默认即启用）。"
+  },
+  "ai_bind_code_ttl": {
+    "description": "确认验证码有效期（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "AI 发起绑定/解绑时会生成 6 位确认码，必须由用户亲手把这串数字发回来才生效；过期需重新发起。最小按 30 秒生效。"
+  },
+  "ai_lookup_cache_seconds": {
+    "description": "按房间名反查余额的结果缓存（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "群里多人重复问同一间宿舍时命中缓存，避免反复打学校接口。设为 0 关闭缓存。"
   }
 }

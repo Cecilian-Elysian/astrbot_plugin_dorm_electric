@@ -37,8 +37,15 @@ def _install_stubs() -> None:
         pass
 
     class MessageChain:
+        def __init__(self):
+            self.chain: list[str] = []
+
         def message(self, text):
+            self.chain.append(text)
             return self
+
+        def get_plain_text(self):
+            return "".join(str(c) for c in self.chain)
 
     class _CmdGroup:
         def command(self, *args, **kwargs):
@@ -47,13 +54,31 @@ def _install_stubs() -> None:
 
             return deco
 
+    class _EventMessageType:
+        ALL = "all"
+        PRIVATE_MESSAGE = "private"
+        GROUP_MESSAGE = "group"
+
+    def _passthrough(*args, **kwargs):
+        def deco(func):
+            return func
+
+        return deco
+
     class _Filter:
+        EventMessageType = _EventMessageType
+
         @staticmethod
         def command_group(*args, **kwargs):
             def deco(func):
                 return _CmdGroup()
 
             return deco
+
+        # 事件级监听器与 LLM 工具注册器在宿主里由元数据登记，
+        # 测试只需透传装饰器本身，桩不做 docstring 解析。
+        event_message_type = staticmethod(_passthrough)
+        llm_tool = staticmethod(_passthrough)
 
     api_event.AstrMessageEvent = AstrMessageEvent
     api_event.MessageChain = MessageChain

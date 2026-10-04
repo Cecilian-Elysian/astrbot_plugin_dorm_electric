@@ -1,19 +1,21 @@
-"""宿舍电费余额监控预警插件。
+﻿"""宿舍电费余额监控预警插件。
 
-- /电费 指令组：绑定宿舍向导、查询、状态、凭证、历史、日志、自检
+- /电费 指令组：绑定宿舍向导、查询、状态、凭证、历史、日志、自检、确认验证码
 - 定时轮询余额 → 低余额/紧急预警（含冷却），预警按会话合并为单条消息
 - 轮询同时保活学校缴费系统会话凭证
 - 每日定时播报：当前余额（两种费种）
+- 7 个 LLM 工具：把学校/宿舍结构、余额、配置交给 AI 对话；写操作需用户回复验证码
 - 数据源：hjnu（学校缴费系统自动查询）
 """
 
 import asyncio
 import re
+import secrets
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -43,6 +45,20 @@ PLUGIN_NAME = "astrbot_plugin_dorm_electric"
 # 选择时仍用全楼层绝对编号，避免超过一页的房间选不到。
 ROOM_PAGE_SIZE = 30
 
+# 待确认项的验证码位数与默认有效期（秒），可被 ai_bind_code_ttl 覆盖。
+CODE_LENGTH = 6
+
+# 群聊是只读的：绑定/解绑会改「群」这份绑定，会影响到群里所有人。
+GROUP_WRITE_DENIED = (
+    "群聊里不能绑定或解绑（会影响到群里所有人）。\n"
+    "请私聊机器人发送 /电费 绑定，我一步步带你弄；"
+    "群里可以随时问我查电费余额。"
+)
+
+# 用户回复验证码时的严格格式：整条消息里除了标点只剩验证码。
+# 这样群里有人问「481526 度电够吗」不会被误判成已同意。
+CODE_ONLY_PATTERN = r"[\s，,。.!！?？:：]*{code}[\s，,。.!！?？:：]*"
+
 CREDENTIAL_HINT = (
     "🔐 学校系统凭证已失效或尚未配置。\n"
     "重新获取 JSESSIONID 后私聊发送：/电费 凭证 JSESSIONID=xxxx\n"
@@ -66,8 +82,8 @@ def electric():
 @register(
     PLUGIN_NAME,
     "Cecilian",
-    "宿舍电费余额监控预警：低余额预警、每日播报、双费种同时查询",
-    "1.0.9",
+    "宿舍电费余额监控预警：低余额预警、每日播报、双费种同时查询、支持 AI 对话绑定",
+    "1.1.0",
 )
 class DormElectricPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -81,6 +97,10 @@ class DormElectricPlugin(Star):
         self._events: deque = deque(maxlen=200)
         self._pending_alerts: dict[str, list[dict]] = {}
         self._last_raw: dict[str, dict[str, Any]] = {}
+        # AI 写操作待确认项：umo → {code, action, at, user_ok, ...}
+        self._bind_tokens: dict[str, dict] = {}
+        # 房间名反查结果缓存：f"{umo}|{token}" → (时间戳, 文案)
+        self._lookup_cache: dict[str, tuple[float, str]] = {}
 
     # ================= 生命周期 =================
 
@@ -133,6 +153,8 @@ class DormElectricPlugin(Star):
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
         self._pending_alerts.clear()
+        self._bind_tokens.clear()
+        self._lookup_cache.clear()
 
     # ================= 工具方法 =================
 
@@ -651,6 +673,951 @@ class DormElectricPlugin(Star):
             {"t": time.time(), "kind": kind, "text": text, "umo": umo}
         )
 
+    # ================= 绑定向导：选择器与渲染器 =================
+    # /电费 指令与 LLM 工具共用同一套选择/渲染逻辑，避免两处实现漂移。
+    # 工具侧「该选哪一层」由 wizard.step 决定，模型传错层级也错不了——
+    # 这正是 /电费 校区/楼栋/楼层/房间「参数选上一层」那个老坑的解法。
+
+    WIZARD_STEPS = ("area", "building", "floor", "room", "bind")
+
+    def _wizard_state(self, umo: str) -> dict:
+        return self._wizard.get(umo) or {}
+
+    def _step(self, umo: str) -> str:
+        step = self._wizard.get(umo, {}).get("step")
+        return step if step in self.WIZARD_STEPS else ""
+
+    @staticmethod
+    def _as_index(raw, total: int, err_text: str) -> tuple[int, str | None]:
+        """把指令参数/模型入参转成 1-based 下标，非法时返回 err_text。"""
+        try:
+            index = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return 0, err_text
+        if not 1 <= index <= total:
+            return 0, err_text
+        return index, None
+
+    async def _select_start(self, umo: str) -> tuple[dict | None, str | None]:
+        """启动向导：取主 aid（fee_items 第 1 项）并加载校区列表。"""
+        items = self.config.get("fee_items", {}) or {}
+        if not items:
+            return None, "配置中没有任何缴费项目（fee_items）。"
+        existing = self._wizard.get(umo) or {}
+        if existing.get("step") not in self.WIZARD_STEPS:
+            self._wizard.pop(umo, None)
+        aid = next(iter(items))
+        try:
+            areas = await self.hjnu.list_areas(aid)
+        except SessionExpiredError:
+            self._record_event(umo, "error", "绑定向导启动失败：凭证已失效")
+            return None, CREDENTIAL_HINT
+        except QueryError as e:
+            self._record_event(umo, "error", f"绑定向导启动失败：{e}")
+            return None, f"❌ {e}"
+        self._wizard[umo] = {"aid": aid, "areas": areas, "step": "area"}
+        self._record_event(umo, "info", f"绑定向导启动，主 aid={items.get(aid, aid)}")
+        return self._wizard[umo], None
+
+    async def _select_area(self, umo: str, raw) -> tuple[dict | None, str | None]:
+        """选校区并加载楼栋列表。"""
+        wizard = self._wizard.get(umo) or {}
+        aid, areas = wizard.get("aid"), wizard.get("areas") or []
+        if not aid or not areas:
+            return None, "用法：/电费 校区 <编号>（先 /电费 绑定 启动向导）"
+        index, err = self._as_index(raw, len(areas), "校区编号无效")
+        if err:
+            return None, err
+        area = areas[index - 1]
+        try:
+            buildings = await self.hjnu.list_buildings(aid, area)
+        except SessionExpiredError:
+            return None, CREDENTIAL_HINT
+        except QueryError as e:
+            return None, f"❌ {e}"
+        wizard["area"], wizard["buildings"], wizard["step"] = area, buildings, "building"
+        self._wizard[umo] = wizard
+        return wizard, None
+
+    async def _select_building(self, umo: str, raw) -> tuple[dict | None, str | None]:
+        """选楼栋并加载楼层列表。"""
+        wizard = self._wizard.get(umo) or {}
+        buildings = wizard.get("buildings") or []
+        if not wizard.get("area") or not buildings:
+            return None, "用法：/电费 楼栋 <编号>（先 /电费 校区）"
+        index, err = self._as_index(raw, len(buildings), "楼栋编号无效")
+        if err:
+            return None, err
+        building = buildings[index - 1]
+        try:
+            floors = await self.hjnu.list_floors(wizard["aid"], wizard["area"], building)
+        except SessionExpiredError:
+            return None, CREDENTIAL_HINT
+        except QueryError as e:
+            return None, f"❌ {e}"
+        wizard["building"], wizard["floors"], wizard["step"] = (
+            building,
+            floors,
+            "floor",
+        )
+        self._wizard[umo] = wizard
+        return wizard, None
+
+    async def _select_floor(self, umo: str, raw) -> tuple[dict | None, str | None]:
+        """选楼层并加载该层房间列表（room_page 归零，等用户/模型第一次翻页）。"""
+        wizard = self._wizard.get(umo) or {}
+        floors = wizard.get("floors") or []
+        if not wizard.get("building") or not floors:
+            return None, "用法：/电费 楼层 <编号>（先 /电费 楼栋）"
+        index, err = self._as_index(raw, len(floors), "楼层编号无效")
+        if err:
+            return None, err
+        floor = floors[index - 1]
+        try:
+            rooms = await self.hjnu.list_rooms(
+                wizard["aid"], wizard["area"], wizard["building"], floor
+            )
+        except SessionExpiredError:
+            return None, CREDENTIAL_HINT
+        except QueryError as e:
+            return None, f"❌ {e}"
+        wizard["floor"], wizard["rooms"], wizard["step"] = floor, rooms, "room"
+        # 0 = 还没显示过任何页，下一次无参查看才展示第 1 页
+        wizard["room_page"] = 0
+        self._wizard[umo] = wizard
+        return wizard, None
+
+    def _render_areas(self, umo: str) -> str:
+        wizard = self._wizard.get(umo) or {}
+        items = self.config.get("fee_items", {}) or {}
+        aid = wizard.get("aid")
+        lines = ["🏫 校区（" + str(items.get(aid, aid)) + "）："]
+        lines.extend(
+            f"{i}. {a.get('areaname')}（{a.get('area')}）"
+            for i, a in enumerate(wizard.get("areas") or [], 1)
+        )
+        lines.append("\n下一步：/电费 校区 <编号>")
+        return "\n".join(lines)
+
+    def _render_buildings(self, umo: str) -> str:
+        wizard = self._wizard.get(umo) or {}
+        lines = ["🏢 楼栋列表："]
+        lines.extend(
+            f"{i}. {b.get('building')}（{b.get('buildingid')}）"
+            for i, b in enumerate(wizard.get("buildings") or [], 1)
+        )
+        lines.append("\n请选择楼栋：发送 /电费 楼栋 <编号>")
+        return "\n".join(lines)
+
+    def _render_floors(self, umo: str) -> str:
+        wizard = self._wizard.get(umo) or {}
+        lines = ["🧱 楼层列表："]
+        lines.extend(
+            f"{i}. {f.get('floor')}（{f.get('floorid')}）"
+            for i, f in enumerate(wizard.get("floors") or [], 1)
+        )
+        lines.append("\n请选择楼层：发送 /电费 楼层 <编号>")
+        return "\n".join(lines)
+
+    def _render_floor_rooms(self, umo: str) -> str:
+        """刚选完楼层时的摘要（不列房间，房间多时一屏放不下）。"""
+        wizard = self._wizard.get(umo) or {}
+        rooms = wizard.get("rooms") or []
+        total = len(rooms)
+        _, _, total_pages = self._room_page(rooms, 1)
+        lines = [
+            f"🧱 {wizard.get('floor', {}).get('floor')}：共 {total} 间"
+            + (f"，分 {total_pages} 页显示" if total_pages > 1 else "")
+        ]
+        lines.append("\n查看房间列表：发送 /电费 房间（无参数即为第 1 页）")
+        return "\n".join(lines)
+
+    def _render_rooms(self, umo: str, page: int, wrapped: bool = False) -> str:
+        wizard = self._wizard.get(umo) or {}
+        rooms = wizard.get("rooms") or []
+        start, end, total_pages = self._room_page(rooms, page)
+        page = start // max(1, ROOM_PAGE_SIZE) + 1  # 越界页码夹回真实页，避免「第 2/1 页」
+        wizard["room_page"] = page
+        self._wizard[umo] = wizard
+        where = (
+            f"{wizard.get('building', {}).get('building')} / "
+            f"{wizard.get('floor', {}).get('floor')}"
+        )
+        lines = [
+            f"🚪 房间列表（{where}）",
+            f"第 {page}/{total_pages} 页 · 本页第 {start + 1}-{end} 间（全楼层共 {len(rooms)} 间）",
+        ]
+        if wrapped:
+            lines.append("（已到末页，回到第 1 页）")
+        lines.append("")
+        lines.extend(
+            f"{i}. {r.get('room')}（{r.get('roomid')}）"
+            for i, r in enumerate(rooms[start:end], start + 1)
+        )
+        lines.append("")
+        if total_pages > 1:
+            lines.append(
+                "翻页：/电费 房间　　跳页：/电费 房间 p<页码>　　选择：/电费 房间 <编号>"
+            )
+        else:
+            lines.append("选择：/电费 房间 <编号>")
+        return "\n".join(lines)
+
+    def _render_room_picked(self, umo: str) -> str:
+        wizard = self._wizard.get(umo) or {}
+        return "\n".join(
+            [
+                (
+                    f"📍 已选择：{wizard.get('area', {}).get('areaname')}/"
+                    f"{wizard.get('building', {}).get('building')}/"
+                    f"{wizard.get('floor', {}).get('floor')}/"
+                    f"{wizard.get('room', {}).get('room')}"
+                ),
+                "",
+                "确认绑定并同时查询空调费、宿舍电费？",
+                "发送 /电费 绑定 1 确认。",
+            ]
+        )
+
+    def _room_listing(self, umo: str, token) -> str:
+        """房间列表的三种语义：无参翻页（末页回绕）、p<页码> 跳页、纯数字选房。
+
+        房间号用全楼层绝对编号，与分页显示的序号一致，所以房间再多也选得到。
+        """
+        wizard = self._wizard.get(umo) or {}
+        rooms = wizard.get("rooms") or []
+        if not rooms:
+            return "用法：/电费 房间 [编号]（先 /电费 楼层）"
+        self._wizard[umo] = wizard
+        token = str(token).strip() if token is not None else ""
+        if token[:1] in ("p", "P") and token[1:].isdigit():
+            page, wrapped = int(token[1:]), False
+        elif token.isdigit():
+            index, err = self._as_index(
+                token,
+                len(rooms),
+                f"房间编号无效：本层共 {len(rooms)} 间，有效编号 1-{len(rooms)}",
+            )
+            if err:
+                return err
+            wizard["room"], wizard["step"] = rooms[index - 1], "bind"
+            return self._render_room_picked(umo)
+        elif token:
+            return (
+                f"无法识别的参数「{token}」。\n"
+                "用法：/电费 房间（翻页）、/电费 房间 p<页码>（跳页）、"
+                "/电费 房间 <编号>（选择，绝对编号）"
+            )
+        else:
+            _, _, total_pages = self._room_page(rooms, 1)
+            if total_pages == 1:
+                page, wrapped = 1, False
+            else:
+                page = int(wizard.get("room_page") or 0) + 1
+                wrapped = page > total_pages
+                if wrapped:
+                    page = 1
+        return self._render_rooms(umo, page, wrapped)
+
+    def _room_no_of(self, umo: str) -> int | None:
+        """当前已选房间在该层的绝对编号，供 AI 调 bind_room 用。"""
+        wizard = self._wizard.get(umo) or {}
+        room = wizard.get("room")
+        if not room:
+            return None
+        for i, r in enumerate(wizard.get("rooms") or [], 1):
+            if r is room or r.get("room") == room.get("room"):
+                return i
+        return None
+
+    def _unbind(self, umo: str) -> str:
+        if self.store and self.store.del_binding(umo):
+            self.store.save()
+            self._wizard.pop(umo, None)
+            self._last_raw.pop(umo, None)
+            return "✅ 已解绑并停止监控。"
+        return "当前会话没有绑定。"
+
+    async def _complete_bind(self, umo: str) -> str:
+        """完成绑定：写绑定、关联宿舍电费、查一次余额、落库。"""
+        wizard = self._wizard.get(umo) or {}
+        room = wizard.get("room")
+        if wizard.get("step") != "bind" or not room:
+            return "请先 /电费 绑定 启动向导，选好房间后再 /电费 绑定 1 确认"
+        area, building, floor = wizard["area"], wizard["building"], wizard["floor"]
+        label = (
+            f"{area.get('areaname')}/{building.get('building')}/"
+            f"{floor.get('floor')}/{room.get('room')}"
+        )
+        ac_params = {
+            "aid": wizard["aid"],
+            "area": area,
+            "building": building,
+            "floor": floor,
+            "room": room,
+        }
+        fees = {"ac": self._fee_entry(ac_params)}
+        elec = await self._match_elec_fee(ac_params)
+        if elec:
+            fees["elec"] = elec
+        binding = {
+            "provider": "hjnu",
+            "room_label": label,
+            "params": ac_params,
+            "fees": fees,
+        }
+        self.store.set_binding(umo, binding)
+        fee_lines, _ = await self._query_and_record(umo, binding)
+        lines = [f"✅ 绑定成功：{label}"]
+        lines.append(
+            "已自动关联宿舍电费房间"
+            if "elec" in fees
+            else "⚠️ 未自动关联宿舍电费（请检查 room token 是否在电费 aid 下也存在）"
+        )
+        lines.extend(fee_lines)
+        lines.append(
+            f"预警线：{self._cfg_float('threshold_warn', 10):g}；"
+            f"紧急线：{self._cfg_float('threshold_critical', 5):g}。轮询与预警已启用。"
+        )
+        self.store.save()
+        self._record_event(
+            umo,
+            "info",
+            f"绑定成功：{label}（{'ac+elec' if 'elec' in fees else '仅 ac'}）",
+        )
+        return "\n".join(lines)
+
+    # ================= AI 对话：确认验证码 =================
+
+    _ACTION_LABEL: ClassVar[dict[str, str]] = {"bind": "绑定", "unbind": "解绑"}
+
+
+    def _ai_enabled(self) -> bool:
+        return self._cfg_bool("ai_tools_enabled", True)
+
+    def _token_ttl(self) -> int:
+        return max(30, self._cfg_int("ai_bind_code_ttl", 300))
+
+    def _purge_tokens(self) -> None:
+        now = time.time()
+        for umo, token in list(self._bind_tokens.items()):
+            if now - float(token.get("at", 0)) >= self._token_ttl():
+                self._bind_tokens.pop(umo, None)
+
+    def _issue_token(self, umo: str, action: str, **payload) -> dict:
+        """生成待确认项；同一会话只保留最新一个，旧码立即作废。"""
+        self._purge_tokens()
+        token = {
+            "code": f"{secrets.randbelow(900000) + 100000:0{CODE_LENGTH}d}",
+            "action": action,
+            "at": time.time(),
+            "user_ok": False,
+        }
+        token.update(payload)
+        self._bind_tokens[umo] = token
+        self._record_event(
+            umo,
+            "ai",
+            f"已生成{self._ACTION_LABEL.get(action, action)}确认码"
+            f"（{token['code']}，{token.get('label', '')}）",
+        )
+        return token
+
+    def _pending_view(self, umo: str) -> str:
+        """未带码时的待确认项概览（只对发起它的会话可见）。"""
+        self._purge_tokens()
+        token = self._bind_tokens.get(umo)
+        if not token:
+            return "当前会话没有待确认的操作。"
+        left = max(0, int(self._token_ttl() - (time.time() - token["at"])))
+        what = (
+            f"绑定到 {token['label']}"
+            if token["action"] == "bind"
+            else f"解绑 {token['label']}"
+        )
+        return (
+            f"⏳ 待确认：{what}\n"
+            f"验证码：{token['code']}（剩余 {left // 60} 分 {left % 60} 秒，"
+            f"{'已收到你的确认' if token['user_ok'] else '等你回复验证码'}）\n"
+            f"回复这个 {CODE_LENGTH} 位数字即可完成，或发 /电费 确认 {token['code']}"
+        )
+
+    def _take_token(self, umo: str, code: str) -> tuple[dict | None, str | None]:
+        """校验并消费待确认项。user_ok 必须由用户亲手回复验证码才置位。"""
+        self._purge_tokens()
+        token = self._bind_tokens.get(umo)
+        if not token:
+            return None, (
+                "本会话没有待确认的操作。需要用户先确认绑定/解绑，"
+                "请重新调用 dorm_electric_bind_room 或 dorm_electric_unbind。"
+            )
+        if str(code or "").strip() != token["code"]:
+            return None, (
+                "验证码不匹配（可能是复述有误）。"
+                "请让用户重新发起一次绑定/解绑，会生成新的验证码。"
+            )
+        if not token.get("user_ok"):
+            return None, (
+                "还没有检测到用户回复验证码，暂不能执行。请让用户把刚才的 "
+                f"{CODE_LENGTH} 位验证码原样发过来（私聊直接发数字即可），"
+                "收到后你再调用本工具。"
+            )
+        self._bind_tokens.pop(umo, None)
+        return token, None
+
+    async def _run_token(self, umo: str, code: str) -> str:
+        """执行待确认项：解绑或完成绑定。"""
+        token, err = self._take_token(umo, code)
+        if err:
+            return err
+        if token["action"] == "unbind":
+            text = self._unbind(umo)
+            self._record_event(umo, "ai", f"用户确认解绑：{text}")
+            return text
+        # 把 issue 时快照的层级写回向导：期间 AI 可能又调了 browse/pick
+        self._wizard.setdefault(umo, {}).update(token.get("wizard") or {})
+        text = await self._complete_bind(umo)
+        self._record_event(umo, "ai", "用户确认绑定")
+        return text
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
+    async def on_user_replied_code(self, event: AstrMessageEvent):
+        """记录「用户亲手回复了确认验证码」。
+
+        放在事件级而不是 on_llm_request：这样标记与 LLM 是否被唤醒、模型是否
+        支持 function calling 完全无关，纯数字消息被别的插件先吃掉也不影响。
+        判定很严——整条消息里除标点外只剩验证码，所以群里问
+        「481526 度电够吗」不会被误判成已同意。不发消息、不阻断事件。
+        """
+        umo = event.unified_msg_origin
+        token = self._bind_tokens.get(umo)
+        if not token or token.get("user_ok"):
+            return
+        text = str(getattr(event, "message_str", "") or "").strip()
+        if not text or not re.fullmatch(
+            CODE_ONLY_PATTERN.format(code=re.escape(token["code"])), text
+        ):
+            return
+        token["user_ok"] = True
+        self._record_event(
+            umo,
+            "ai",
+            f"用户已回复{self._ACTION_LABEL.get(token['action'], token['action'])}确认码",
+        )
+
+    # ================= AI 对话：绑定向导工具 =================
+    # 工具返回值语义（AstrBot v4.27 astr_agent_tool_exec._execute_local）：
+    #   return str            → 文本作为工具结果喂给 LLM
+    #   yield plain_result()  → 框架把消息直接发到聊天窗口，LLM 收不到
+    # 所以查询类一律 return；生成验证码的两个工具用 event.send() 直发，
+    # 再 return 一句给 LLM 的指令，避免它复述 6 位数字出错。
+
+    @filter.llm_tool(name="dorm_electric_browse")
+    async def tool_dorm_electric_browse(self, event: AstrMessageEvent) -> str:
+        """查看宿舍电费的学校结构：当前该选校区、楼栋、楼层还是房间。
+
+        第一次调用会从「校区」开始；之后按已选到的层级继续往下。
+        只读，群里也能用。
+        """
+        if not self._ai_enabled():
+            return "电费 AI 工具已被插件配置关闭。"
+        umo = event.unified_msg_origin
+        step = self._step(umo)
+        if not step:
+            _, err = await self._select_start(umo)
+            if err:
+                return err
+            return self._render_areas(umo) + "\n\n（下一步：确定校区后调用 dorm_electric_pick(index=N)）"
+        if step == "bind":
+            return (
+                self._render_room_picked(umo)
+                + f"\n\n（下一步：调用 dorm_electric_bind_room(room_no={self._room_no_of(umo)}）"
+                " 发起绑定，用户回复验证码后再调用 dorm_electric_confirm）"
+            )
+        if step == "room":
+            return (
+                self._room_listing(umo, None)
+                + "\n\n（下一步：调用 dorm_electric_pick(index=房间编号) 选房，"
+                "或 dorm_electric_pick(page=N) 翻页）"
+            )
+        body = {
+            "area": self._render_areas,
+            "building": self._render_buildings,
+            "floor": self._render_floors,
+        }[step](umo)
+        hint = {
+            "area": "（下一步：调用 dorm_electric_pick(index=校区编号)）",
+            "building": "（下一步：调用 dorm_electric_pick(index=楼栋编号)）",
+            "floor": "（下一步：调用 dorm_electric_pick(index=楼层编号)）",
+        }[step]
+        return f"{body}\n\n{hint}"
+
+    @filter.llm_tool(name="dorm_electric_pick")
+    async def tool_dorm_electric_pick(
+        self,
+        event: AstrMessageEvent,
+        index: int = 0,
+        page: int = 0,
+    ) -> str:
+        """在最近一次 dorm_electric_browse 列出的选项里选一项，往下一层走。
+
+        Args:
+            index(int): 要选的序号，取自 browse 结果里带编号的那一行
+            page(int): 当前层是房间列表时要翻到第几页，0 表示不翻页
+        """
+        if not self._ai_enabled():
+            return "电费 AI 工具已被插件配置关闭。"
+        umo = event.unified_msg_origin
+        step = self._step(umo)
+        if not step:
+            return "还没有开始浏览流程，请先调用 dorm_electric_browse() 查看可选的校区。"
+        if step == "bind":
+            return (
+                self._render_room_picked(umo)
+                + f"\n\n（下一步：调用 dorm_electric_bind_room(room_no={self._room_no_of(umo)}）"
+                " 发起绑定）"
+            )
+        if step == "area":
+            _, err = await self._select_area(umo, index)
+            return err or (
+                self._render_buildings(umo)
+                + "\n\n（下一步：调用 dorm_electric_pick(index=楼栋编号)）"
+            )
+        if step == "building":
+            _, err = await self._select_building(umo, index)
+            return err or (
+                self._render_floors(umo)
+                + "\n\n（下一步：调用 dorm_electric_pick(index=楼层编号)）"
+            )
+        if step == "floor":
+            _, err = await self._select_floor(umo, index)
+            return err or (
+                self._render_floor_rooms(umo)
+                + "\n\n（下一步：调用 dorm_electric_browse() 查看该层房间，"
+                "或 dorm_electric_pick(index=房间编号) 直接选）"
+            )
+        # step == "room"：page 给就翻页，否则 index 当全楼层绝对编号选房
+        if page:
+            return self._room_listing(umo, f"p{int(page)}")
+        return self._room_listing(umo, index)
+
+    @filter.llm_tool(name="dorm_electric_bind_room")
+    async def tool_dorm_electric_bind_room(
+        self, event: AstrMessageEvent, room_no: int = 0
+    ) -> str:
+        """选定房间并向用户发一个确认验证码（此时还没真正绑定）。
+
+        Args:
+            room_no(int): 房间在 dorm_electric_browse 房间列表里的编号（全楼层绝对编号）
+        """
+        if not self._ai_enabled():
+            return "电费 AI 工具已被插件配置关闭。"
+        if not event.is_private_chat():
+            return GROUP_WRITE_DENIED
+        umo = event.unified_msg_origin
+        wizard = self._wizard_state(umo)
+        # step 为 room 是刚看到列表；为 bind 是已选好房间但还没确认
+        if self._step(umo) not in ("room", "bind") or not wizard.get("rooms"):
+            return "还没选到房间列表，请先调用 dorm_electric_browse() 逐级选到房间。"
+        rooms = wizard["rooms"]
+        index, err = self._as_index(
+            room_no, len(rooms), f"房间编号无效：本层共 {len(rooms)} 间，有效编号 1-{len(rooms)}"
+        )
+        if err:
+            return err
+        self._room_listing(umo, index)
+        label = self._wizard_state(umo).get("room", {}).get("room", "")
+        pending = self._bind_tokens.get(umo)
+        if pending and pending.get("action") == "bind" and pending.get("room_no") == index:
+            return f"{label} 的绑定验证码仍是 {pending['code']}，请让用户回复这个验证码。"
+        binding = self.store.get_binding(umo) if self.store else None
+        if binding:
+            return (
+                f"当前已绑定 {self._binding_label(binding)}，改绑要先解绑：\n"
+                "请调用 dorm_electric_unbind() 拿到解绑验证码，用户回复确认后，"
+                "再从 browse/pick 走到这个房间并调用本工具完成新绑定。"
+            )
+        token = self._issue_token(
+            umo,
+            "bind",
+            room_no=index,
+            label=label,
+            wizard={
+                "aid": wizard.get("aid"),
+                "area": wizard.get("area"),
+                "building": wizard.get("building"),
+                "floor": wizard.get("floor"),
+                "room": wizard.get("room"),
+                "step": "bind",
+            },
+        )
+        await event.send(
+            MessageChain().message(
+                f"📍 待绑定：{label}\n"
+                f"确认码：{token['code']}（{self._token_ttl() // 60} 分钟内有效，一次性）\n"
+                f"请把 {CODE_LENGTH} 位确认码原样发给我，收到后我立刻完成绑定并报当前余额。"
+            )
+        )
+        return (
+            f"已向用户直接发出 {label} 的确认码（{token['code']}）。"
+            "不要复述这串数字，等用户回复后你调用 dorm_electric_confirm(code=用户回复的码)。"
+        )
+
+    @filter.llm_tool(name="dorm_electric_unbind")
+    async def tool_dorm_electric_unbind(self, event: AstrMessageEvent) -> str:
+        """向用户发一个解绑确认验证码（此时还没解绑）。"""
+        if not self._ai_enabled():
+            return "电费 AI 工具已被插件配置关闭。"
+        if not event.is_private_chat():
+            return GROUP_WRITE_DENIED
+        umo = event.unified_msg_origin
+        binding = self.store.get_binding(umo) if self.store else None
+        if not binding:
+            return "当前会话没有绑定，无需解绑。"
+        label = self._binding_label(binding)
+        pending = self._bind_tokens.get(umo)
+        if pending and pending.get("action") == "unbind":
+            return f"解绑 {label} 的验证码仍是 {pending['code']}，请让用户回复这个验证码。"
+        token = self._issue_token(umo, "unbind", label=label)
+        await event.send(
+            MessageChain().message(
+                f"🗑️ 待解绑：{label}\n"
+                f"确认码：{token['code']}（{self._token_ttl() // 60} 分钟内有效，一次性）\n"
+                f"确认后我会停止监控这个房间。回复 {CODE_LENGTH} 位确认码即可。"
+            )
+        )
+        return (
+            f"已向用户直接发出解绑 {label} 的确认码（{token['code']}）。"
+            "不要复述这串数字，等用户回复后你调用 dorm_electric_confirm(code=用户回复的码)。"
+        )
+
+    @filter.llm_tool(name="dorm_electric_confirm")
+    async def tool_dorm_electric_confirm(
+        self, event: AstrMessageEvent, code: str = ""
+    ) -> str:
+        """提交用户回复的确认码，完成绑定或解绑。
+
+        Args:
+            code(string): 用户刚刚回复的确认码，必须是用户亲手发的那串数字
+        """
+        if not self._ai_enabled():
+            return "电费 AI 工具已被插件配置关闭。"
+        if not event.is_private_chat():
+            return GROUP_WRITE_DENIED
+        return await self._run_token(event.unified_msg_origin, code)
+
+    # ================= AI 对话：查询工具 =================
+
+    def _config_brief(self) -> str:
+        """给 AI 的一句话配置摘要：预警线、播报时间、轮询间隔。"""
+        poll = self._cfg("poll_interval_minutes", 20)
+        return (
+            f"预警线 {self._cfg_float('threshold_warn', 10):g} / "
+            f"紧急线 {self._cfg_float('threshold_critical', 5):g}"
+            f"（空调费单位度，宿舍电费单位元）；"
+            f"每日播报 {self._cfg('daily_time', '08:00')}"
+            f"（{self._cfg('daily_timezone', 'Asia/Shanghai')}）；"
+            f"轮询间隔 {poll} 分钟"
+            + ("（已关闭）" if not poll else "")
+        )
+
+    @staticmethod
+    def _alert_hint(value: float, warn: float, critical: float) -> str:
+        if value <= critical:
+            return f"⚠️ 已低于紧急线 {critical:g}，建议马上充值。"
+        if value <= warn:
+            return f"⚠️ 已低于预警线 {warn:g}，建议尽快充值。"
+        return "✅ 高于预警线，状态正常。"
+
+    @filter.llm_tool(name="dorm_electric_balance")
+    async def tool_dorm_electric_balance(
+        self, event: AstrMessageEvent, days: int = 0
+    ) -> str:
+        """查本会话绑定宿舍的当前电费余额（空调费 + 宿舍电费），顺带告知预警线与播报设置。
+
+        Args:
+            days(int): 顺便看最近几天的每日余额，0 表示只看当前余额，最大 14
+        """
+        if not self._ai_enabled():
+            return "电费 AI 工具已被插件配置关闭。"
+        umo = event.unified_msg_origin
+        binding = self.store.get_binding(umo) if self.store else None
+        if not binding:
+            return (
+                "本会话还没有绑定宿舍。请像平常聊天一样反问用户要查哪一间宿舍"
+                "（房间号或「楼栋+楼层+房间」都行），拿到后用 dorm_electric_query_room 当场查；"
+                "如果他希望每天被提醒余额，再引导他私聊完成绑定。"
+            )
+        results = await self._fetch_fees(binding)
+        self._remember_raw(umo, results)
+        warn = self._cfg_float("threshold_warn", 10)
+        critical = self._cfg_float("threshold_critical", 5)
+        if critical > warn:
+            warn, critical = critical, warn
+        lines = [f"⚡ {self._binding_label(binding)}"]
+        lines.extend(self._format_fee_results(results, include_missing=True))
+        for kind in ("ac", "elec"):
+            result = results.get(kind)
+            if result is not None and result.ok and result.value is not None:
+                lines.append(
+                    f"  {self._fee_name(kind)}："
+                    f"{self._alert_hint(result.value, warn, critical)}"
+                )
+
+        lines.append(self._config_brief())
+        if days:
+            lines.extend(self._trend_lines(binding, int(days)))
+        return "\n".join(lines)
+
+    def _trend_lines(self, binding: dict, days: int) -> list[str]:
+        """按天余额趋势（只读历史，不写）。"""
+        days = max(1, min(14, days))
+        tz = self._resolve_tz(self._cfg("daily_timezone", "Asia/Shanghai"))
+        lines = [f"\n📈 最近 {days} 天每日余额："]
+        for kind in ("ac", "elec"):
+            history = (binding.get("history_by_fee") or {}).get(kind) or []
+            if not history:
+                continue
+            snaps = self._daily_snapshots(history, tz, days)
+            chron = list(reversed(snaps))
+            cells = []
+            for date, rec in chron:
+                if rec is None:
+                    continue
+                cells.append(f"{date.strftime('%m-%d')} {float(rec['v']):.2f}")
+            if cells:
+                lines.append(f"  {self._fee_name(kind)}：" + " → ".join(cells))
+            stats = self._history_stats(history)
+            if stats:
+                extra = (
+                    f"，检测到充值 +{stats['recharged_24h']:.2f}"
+                    if stats["recharged_24h"] > 0
+                    else ""
+                )
+                lines.append(
+                    f"  {self._fee_name(kind)}：24h 用电 {stats['usage_24h']:.2f} "
+                    f"{history[-1].get('u', '度')} | 日均 {stats['per_day']:.2f} | "
+                    f"最低 {stats['min']:.2f} / 最高 {stats['max']:.2f}{extra}"
+                )
+        if len(lines) == 1:
+            lines.append("  （暂无历史数据，等轮询几轮就有了）")
+        return lines
+
+    # 房间名反查：A-8-17 / A817 / 春雪楼2 8层 A817
+    HINT_ROOM_RE = re.compile(r"([A-Za-z]+)[-_ ]?(\d+)(?:[-_ ]?(\d+))?")
+    HINT_FLOOR_RE = re.compile(r"(\d+)\s*层")
+    LOOKUP_BUILDING_BUDGET = 12
+    LOOKUP_ROOM_BUDGET = 12
+
+    @classmethod
+    def _parse_room_hint(cls, hint: str) -> tuple[str, str]:
+        """从口语里抽出房间 token（A817）与楼层号（8）。
+
+        「A-8-17」自带楼层段；「A817」这类紧凑写法再从「8层」里捞楼层；
+        都没有就留空，由 _resolve_room 按受限的逐层搜索去找。
+        """
+        text = str(hint or "")
+        m = cls.HINT_ROOM_RE.search(text)
+        if not m:
+            return "", ""
+        letters, second, third = m.groups()
+        token = f"{letters}{second}{third or ''}"
+        if third:
+            return token, second
+        floor = cls.HINT_FLOOR_RE.search(text)
+        return token, (floor.group(1) if floor else "")
+
+    async def _resolve_room(self, umo: str, hint: str) -> tuple[dict | None, str | None]:
+        """按房间名反查学校侧的房间参数。返回 (ac_params, err)。
+
+        搜索有请求预算上限（学校接口每层一次请求，全校扫一遍要几十次）：
+        给了楼层就只在匹配楼层找；没给楼层就按「先每栋楼第一层、再每栋楼第二层」
+        的顺序轮转，命中不了就反问用户补楼栋和楼层。
+        """
+        token, floor_no = self._parse_room_hint(hint)
+        if not token:
+            return None, (
+                "没认出房间号。房间号形如 A-8-17 或 A817，"
+                "也可以连楼栋一起说，例如「春雪楼2 8层 A817」。"
+            )
+        items = self.config.get("fee_items", {}) or {}
+        aids = list(items)
+        if not aids:
+            return None, "配置中没有任何缴费项目（fee_items）。"
+        aid = aids[0]
+        try:
+            areas = await self.hjnu.list_areas(aid)
+            area = next(
+                (a for a in areas if a.get("areaname") == "校本部"),
+                (areas or [None])[0],
+            )
+            if not area:
+                return None, "学校没有返回校区列表。"
+            buildings = await self.hjnu.list_buildings(aid, area)
+        except SessionExpiredError:
+            return None, CREDENTIAL_HINT
+        except QueryError as e:
+            return None, f"❌ {e}"
+        if not buildings:
+            return None, "学校没有返回楼栋列表。"
+        text = str(hint)
+        order: list[dict] = []
+        # 优先级：提示里点名的楼栋 > 本会话已绑定的楼栋 > 其余
+        named = next(
+            (b for b in buildings if b.get("building") and b["building"] in text), None
+        )
+        if named:
+            order.append(named)
+        bound = self.store.get_binding(umo) if self.store else None
+        bound_name = (bound or {}).get("params", {}).get("building", {}).get("building")
+        if bound_name:
+            same = next((b for b in buildings if b.get("building") == bound_name), None)
+            if same and same not in order:
+                order.append(same)
+        order.extend(b for b in buildings if b not in order)
+        order = order[: self.LOOKUP_BUILDING_BUDGET]
+
+        async def floors_of(building: dict) -> list[dict]:
+            try:
+                return await self.hjnu.list_floors(aid, area, building)
+            except QueryError:
+                return []
+
+        floors_by_building = list(
+            zip(order, await asyncio.gather(*(floors_of(b) for b in order)), strict=False)
+        )
+        pairs: list[tuple[dict, dict]] = []
+        if floor_no:
+            for building, floors in floors_by_building:
+                floor = next(
+                    (
+                        f
+                        for f in floors
+                        if str(f.get("floor", "")).replace("层", "").strip() == floor_no
+                    ),
+                    None,
+                )
+                if floor:
+                    pairs.append((building, floor))
+        else:
+            depth = 0
+            while len(pairs) < self.LOOKUP_ROOM_BUDGET:
+                added = False
+                for building, floors in floors_by_building:
+                    if len(floors) > depth:
+                        pairs.append((building, floors[depth]))
+                        added = True
+                        if len(pairs) >= self.LOOKUP_ROOM_BUDGET:
+                            break
+                if not added:
+                    break
+                depth += 1
+        pairs = pairs[: self.LOOKUP_ROOM_BUDGET]
+        if not pairs:
+            if floor_no:
+                scope = f"{named['building']} " if named else "学校那边"
+                return None, (
+                    f"{scope}没有 {floor_no} 层（关键词 {token}）。"
+                    "请让用户确认楼栋和楼层，例如「春雪楼2 8层 A817」。"
+                )
+            return None, (
+                f"在学校里没找到关键词 {token} 对应的房间。请让用户补全楼栋和楼层，"
+                "例如「春雪楼2 8层 A817」。"
+            )
+
+
+        async def rooms_of(pair: tuple[dict, dict]) -> tuple[dict, dict, list[dict]]:
+            building, floor = pair
+            try:
+                return building, floor, await self.hjnu.list_rooms(
+                    aid, area, building, floor
+                )
+            except QueryError:
+                return building, floor, []
+
+        hits: list[tuple[dict, dict, dict]] = []
+        for building, floor, rooms in await asyncio.gather(
+            *(rooms_of(p) for p in pairs)
+        ):
+            for room in rooms:
+                name = str(room.get("room", ""))
+                if token.lower() in re.sub(r"[^A-Za-z0-9]", "", name).lower():
+                    hits.append((building, floor, room))
+                    break
+        if not hits:
+            return None, f"没找到房间号包含 {token} 的房间，请让用户确认一下房间号。"
+        if len(hits) > 1:
+            options = "、".join(
+                f"{b.get('building')}/{f.get('floor')}/{r.get('room')}"
+                for b, f, r in hits[:8]
+            )
+            return None, f"找到多个匹配的房间：{options}。请反问用户是哪一个。"
+        building, floor, room = hits[0]
+        return (
+            {
+                "aid": aid,
+                "area": area,
+                "building": building,
+                "floor": floor,
+                "room": room,
+            },
+            None,
+        )
+
+    async def _query_room_balance(self, umo: str, hint: str) -> str:
+        params, err = await self._resolve_room(umo, hint)
+        if err:
+            return err
+        assert params
+        label = (
+            f"{params['area'].get('areaname')}/{params['building'].get('building')}/"
+            f"{params['floor'].get('floor')}/{params['room'].get('room')}"
+        )
+        fees = {"ac": self._fee_entry(params)}
+        elec = await self._match_elec_fee(params)
+        if elec:
+            fees["elec"] = elec
+        # 只读：构造临时 binding 走 _fetch_fees，不落库、不写历史
+        results = await self._fetch_fees(
+            {"provider": "hjnu", "room_label": label, "params": params, "fees": fees}
+        )
+        self._remember_raw(umo, results)
+        lines = [f"⚡ {label}"]
+        lines.extend(self._format_fee_results(results, include_missing=True))
+        if "elec" not in fees:
+            lines.append("（该房间没有对应的宿舍电费项目，只查到空调费）")
+        return "\n".join(lines)
+
+    @filter.llm_tool(name="dorm_electric_query_room")
+    async def tool_dorm_electric_query_room(
+        self, event: AstrMessageEvent, room_hint: str = ""
+    ) -> str:
+        """按房间名/编号查任意宿舍的当前电费余额，不需要绑定。
+
+        Args:
+            room_hint(string): 房间号或「楼栋+楼层+房间」，例如 A-8-17、A817、春雪楼2 8层 A817
+        """
+        if not self._ai_enabled():
+            return "电费 AI 工具已被插件配置关闭。"
+        umo = event.unified_msg_origin
+        token, _ = self._parse_room_hint(room_hint)
+        cache_key = f"{umo}|{token or room_hint}"
+        ttl = max(0, self._cfg_int("ai_lookup_cache_seconds", 60))
+        cached = self._lookup_cache.get(cache_key)
+        if cached and ttl and time.time() - cached[0] < ttl:
+            return f"{cached[1]}\n（{int(time.time() - cached[0])} 秒前的结果，缓存命中）"
+        text = await self._query_room_balance(umo, room_hint)
+        if ttl and "⚡" in text:
+            if len(self._lookup_cache) >= 200:
+                # 顺手清掉最老的一批，避免长期运行无限增长
+                for key, _ in sorted(
+                    self._lookup_cache.items(), key=lambda kv: kv[1][0]
+                )[:50]:
+                    self._lookup_cache.pop(key, None)
+            self._lookup_cache[cache_key] = (time.time(), text)
+        return text
+
+
     # ================= 指令：帮助与状态 =================
 
     @electric.command("帮助", alias={"help"})
@@ -660,19 +1627,23 @@ class DormElectricPlugin(Star):
         critical = self._cfg_float("threshold_critical", 5)
         yield event.plain_result(
             "⚡ 宿舍电费监控指令：\n"
-            "/电费 绑定 — 启动绑定宿舍向导（自动同时关联空调费 + 宿舍电费）\n"
+            "日常直接跟机器人聊天就行（问余额、报房间号查电费、让他帮你绑定），"
+            "下面这些是给 AI 兜底和进阶用的：\n"
+            "/电费 绑定 — 启动绑定宿舍向导（自动同时关联空调费 + 宿舍电费，仅私聊）\n"
             "/电费 校区/楼栋/楼层 <编号> — 逐级选择宿舍\n"
             "/电费 房间 — 浏览房间列表（无参翻页，p<页码> 跳页）\n"
             "/电费 房间 <编号> — 按全楼层绝对编号选择房间\n"
             "/电费 绑定 1 — 确认绑定\n"
-            "/电费 解绑 — 取消监控\n"
+            "/电费 确认 [验证码] — 提交 AI 给的确认码（不带参数则查看待确认项）\n"
+            "/电费 解绑 — 取消监控（仅私聊）\n"
             "/电费 查询 — 同时查询空调费和宿舍电费\n"
             "/电费 凭证 <JSESSIONID=...> — 更新会话凭证（仅限私聊，热更新）\n"
             "/电费 历史 [n] — 查看最近 n 天每日余额（默认 7 天，最多 60 天）\n"
             "/电费 日志 [n] — 查看最近 n 条事件 + 最近一次原始返回（默认 20，最多 100）\n"
             "/电费 状态 — 查看绑定与运行状态\n"
             "/电费 检查 — 自检：凭证是否生效 + 绑定是否正确 + 余额能否查到\n"
-            f"预警线：{warn:g}；紧急线：{critical:g}（空调费单位为度，宿舍电费单位为元）"
+            f"预警线：{warn:g}；紧急线：{critical:g}（空调费单位为度，宿舍电费单位为元）\n"
+            "群里只能查询余额，报房间号即可；绑定/解绑请私聊"
         )
 
     @electric.command("状态")
@@ -802,283 +1773,89 @@ class DormElectricPlugin(Star):
     async def cmd_area(self, event: AstrMessageEvent, area_id: str | None = None):
         """选择缴费项目的校区"""
         umo = event.unified_msg_origin
-        wizard = self._wizard.get(umo) or {}
-        items = self.config.get("fee_items", {}) or {}
-        if not items:
+        if not (self.config.get("fee_items", {}) or {}):
             yield event.plain_result("配置中没有任何缴费项目（fee_items）。")
             return
-        aid = wizard.get("aid")
-        areas = wizard.get("areas") or []
-        if not aid or not areas or area_id is None:
+        if area_id is None:
             yield event.plain_result("用法：/电费 校区 <编号>（先 /电费 绑定 启动向导）")
             return
-        try:
-            area = areas[int(area_id) - 1]
-        except (ValueError, IndexError):
-            yield event.plain_result("校区编号无效")
-            return
-        try:
-            buildings = await self.hjnu.list_buildings(aid, area)
-        except SessionExpiredError:
-            yield event.plain_result(CREDENTIAL_HINT)
-            return
-        except QueryError as e:
-            yield event.plain_result(f"❌ {e}")
-            return
-        wizard["area"], wizard["buildings"], wizard["step"] = area, buildings, "building"
-        lines = ["🏢 楼栋列表："]
-        lines.extend(f"{i}. {b.get('building')}（{b.get('buildingid')}）" for i, b in enumerate(buildings, 1))
-        lines.append("\n请选择楼栋：发送 /电费 楼栋 <编号>")
-        yield event.plain_result("\n".join(lines))
+        _, err = await self._select_area(umo, area_id)
+        yield event.plain_result(err or self._render_buildings(umo))
 
     @electric.command("楼栋")
     async def cmd_building(self, event: AstrMessageEvent, building_id: str | None = None):
         """选择楼栋"""
         umo = event.unified_msg_origin
-        wizard = self._wizard.get(umo) or {}
-        buildings = wizard.get("buildings") or []
-        if building_id is None or not buildings:
+        if building_id is None or not (self._wizard_state(umo).get("buildings") or []):
             yield event.plain_result("用法：/电费 楼栋 <编号>（先 /电费 校区）")
             return
-        try:
-            building = buildings[int(building_id) - 1]
-        except (ValueError, IndexError):
-            yield event.plain_result("楼栋编号无效")
-            return
-        try:
-            floors = await self.hjnu.list_floors(wizard["aid"], wizard["area"], building)
-        except SessionExpiredError:
-            yield event.plain_result(CREDENTIAL_HINT)
-            return
-        except QueryError as e:
-            yield event.plain_result(f"❌ {e}")
-            return
-        wizard["building"], wizard["floors"], wizard["step"] = building, floors, "floor"
-        lines = ["🧱 楼层列表："]
-        lines.extend(f"{i}. {f.get('floor')}（{f.get('floorid')}）" for i, f in enumerate(floors, 1))
-        lines.append("\n请选择楼层：发送 /电费 楼层 <编号>")
-        yield event.plain_result("\n".join(lines))
+        _, err = await self._select_building(umo, building_id)
+        yield event.plain_result(err or self._render_floors(umo))
 
     @electric.command("楼层")
     async def cmd_floor(self, event: AstrMessageEvent, floor_id: str | None = None):
         """选择楼层"""
         umo = event.unified_msg_origin
-        wizard = self._wizard.get(umo) or {}
-        floors = wizard.get("floors") or []
-        if floor_id is None or not floors:
+        if floor_id is None or not (self._wizard_state(umo).get("floors") or []):
             yield event.plain_result("用法：/电费 楼层 <编号>（先 /电费 楼栋）")
             return
-        try:
-            floor = floors[int(floor_id) - 1]
-        except (ValueError, IndexError):
-            yield event.plain_result("楼层编号无效")
-            return
-        try:
-            rooms = await self.hjnu.list_rooms(
-                wizard["aid"], wizard["area"], wizard["building"], floor
-            )
-        except SessionExpiredError:
-            yield event.plain_result(CREDENTIAL_HINT)
-            return
-        except QueryError as e:
-            yield event.plain_result(f"❌ {e}")
-            return
-        wizard["floor"], wizard["rooms"], wizard["step"] = floor, rooms, "room"
-        # 0 = 还没显示过任何页，下一次 /电费 房间 无参才展示第 1 页
-        wizard["room_page"] = 0
-        total = len(rooms)
-        _, _, total_pages = self._room_page(rooms, 1)
-        lines = [
-            f"🧱 {floor.get('floor')}：共 {total} 间"
-            + (f"，分 {total_pages} 页显示" if total_pages > 1 else "")
-        ]
-        lines.append("\n查看房间列表：发送 /电费 房间（无参数即为第 1 页）")
-        yield event.plain_result("\n".join(lines))
+        _, err = await self._select_floor(umo, floor_id)
+        yield event.plain_result(err or self._render_floor_rooms(umo))
 
     @electric.command("房间")
     async def cmd_room(self, event: AstrMessageEvent, room_no: str | None = None):
         """浏览房间列表（无参翻页、p<页码>跳页）或按绝对编号选择房间"""
-        umo = event.unified_msg_origin
-        wizard = self._wizard.get(umo) or {}
-        rooms = wizard.get("rooms") or []
-        if not rooms:
-            yield event.plain_result("用法：/电费 房间 [编号]（先 /电费 楼层）")
-            return
-        # AstrBot 可能把纯数字参数转成 int，统一按字符串处理
-        token = str(room_no).strip() if room_no is not None else ""
-
-        if token[:1] in ("p", "P") and token[1:].isdigit():
-            page = int(token[1:])
-            wrapped = False
-        elif token.isdigit():
-            index = int(token) - 1
-            if not 0 <= index < len(rooms):
-                yield event.plain_result(
-                    f"房间编号无效：本层共 {len(rooms)} 间，有效编号 1-{len(rooms)}"
-                )
-                return
-            room = rooms[index]
-            wizard["room"], wizard["step"] = room, "bind"
-            yield event.plain_result(
-                "\n".join(
-                    [
-                        (
-                            f"📍 已选择：{wizard['area'].get('areaname')}/"
-                            f"{wizard['building'].get('building')}/"
-                            f"{wizard['floor'].get('floor')}/{room.get('room')}"
-                        ),
-                        "",
-                        "确认绑定并同时查询空调费、宿舍电费？",
-                        "发送 /电费 绑定 1 确认。",
-                    ]
-                )
-            )
-            return
-        elif token:
-            yield event.plain_result(
-                f"无法识别的参数「{token}」。\n"
-                "用法：/电费 房间（翻页）、/电费 房间 p<页码>（跳页）、"
-                "/电费 房间 <编号>（选择，绝对编号）"
-            )
-            return
-        else:
-            _, _, total_pages = self._room_page(rooms, 1)
-            if total_pages == 1:
-                page, wrapped = 1, False
-            else:
-                page = int(wizard.get("room_page") or 0) + 1
-                wrapped = page > total_pages
-                if wrapped:
-                    page = 1
-
-        start, end, total_pages = self._room_page(rooms, page)
-        wizard["room_page"] = page
-        where = f"{wizard.get('building', {}).get('building')} / {wizard.get('floor', {}).get('floor')}"
-        lines = [
-            f"🚪 房间列表（{where}）",
-            f"第 {page}/{total_pages} 页 · 本页第 {start + 1}-{end} 间（全楼层共 {len(rooms)} 间）",
-        ]
-        if wrapped:
-            lines.append("（已到末页，回到第 1 页）")
-        lines.append("")
-        lines.extend(
-            f"{i}. {r.get('room')}（{r.get('roomid')}）"
-            for i, r in enumerate(rooms[start:end], start + 1)
+        yield event.plain_result(
+            self._room_listing(event.unified_msg_origin, room_no)
         )
-        lines.append("")
-        if total_pages > 1:
-            lines.append(
-                "翻页：/电费 房间　　跳页：/电费 房间 p<页码>　　选择：/电费 房间 <编号>"
-            )
-        else:
-            lines.append("选择：/电费 房间 <编号>")
-        yield event.plain_result("\n".join(lines))
 
     @electric.command("绑定")
     async def cmd_bind(self, event: AstrMessageEvent, confirm: str | None = None):
         """启动绑定宿舍向导（无参）或确认绑定（带参 1）。"""
+        if not event.is_private_chat():
+            yield event.plain_result(GROUP_WRITE_DENIED)
+            return
         umo = event.unified_msg_origin
-        items = self.config.get("fee_items", {}) or {}
-        if not items:
+        if not (self.config.get("fee_items", {}) or {}):
             yield event.plain_result("配置中没有任何缴费项目（fee_items）。")
             return
-
         if confirm is None:
-            # 启动向导：取 fee_items 第 1 项 aid 作主线；老的 wizard 状态若不在新流程 step 列表中则重置
-            valid_steps = {"area", "building", "floor", "room", "bind"}
-            existing = self._wizard.get(umo) or {}
-            if existing.get("step") not in valid_steps:
-                self._wizard.pop(umo, None)
-            aid = next(iter(items))
-            try:
-                areas = await self.hjnu.list_areas(aid)
-            except SessionExpiredError:
-                yield event.plain_result(CREDENTIAL_HINT)
-                self._record_event(umo, "error", "绑定向导启动失败：凭证已失效")
-                return
-            except QueryError as e:
-                yield event.plain_result(f"❌ {e}")
-                self._record_event(umo, "error", f"绑定向导启动失败：{e}")
-                return
-            self._wizard[umo] = {"aid": aid, "areas": areas, "step": "area"}
-            lines = ["🏫 校区（" + str(items.get(aid, aid)) + "）："]
-            lines.extend(
-                f"{i}. {a.get('areaname')}（{a.get('area')}）"
-                for i, a in enumerate(areas, 1)
-            )
-            lines.append("\n下一步：/电费 校区 <编号>")
-            self._record_event(
-                umo, "info", f"绑定向导启动，主 aid={items.get(aid, aid)}"
-            )
-            yield event.plain_result("\n".join(lines))
+            _, err = await self._select_start(umo)
+            yield event.plain_result(err or self._render_areas(umo))
             return
-
-        wizard = self._wizard.get(umo) or {}
-        if (
-            str(confirm) != "1"
-            or wizard.get("step") != "bind"
-            or not wizard.get("room")
-        ):
+        if str(confirm) != "1":
             yield event.plain_result(
                 "请先 /电费 绑定 启动向导，选好房间后再 /电费 绑定 1 确认"
             )
             return
-        room = wizard["room"]
-        area, building = wizard["area"], wizard["building"]
-        floor = wizard["floor"]
-        label = (
-            f"{area.get('areaname')}/{building.get('building')}/"
-            f"{floor.get('floor')}/{room.get('room')}"
-        )
-        ac_params = {
-            "aid": wizard["aid"],
-            "area": area,
-            "building": building,
-            "floor": floor,
-            "room": room,
-        }
-        fees = {"ac": self._fee_entry(ac_params)}
-        elec = await self._match_elec_fee(ac_params)
-        if elec:
-            fees["elec"] = elec
-        binding = {
-            "provider": "hjnu",
-            "room_label": label,
-            "params": ac_params,
-            "fees": fees,
-        }
-        self.store.set_binding(umo, binding)
-        fee_lines, _ = await self._query_and_record(umo, binding)
-        lines = [f"✅ 绑定成功：{label}"]
-        lines.append(
-            "已自动关联宿舍电费房间"
-            if "elec" in fees
-            else "⚠️ 未自动关联宿舍电费（请检查 room token 是否在电费 aid 下也存在）"
-        )
-        lines.extend(fee_lines)
-        lines.append(
-            f"预警线：{self._cfg_float('threshold_warn', 10):g}；"
-            f"紧急线：{self._cfg_float('threshold_critical', 5):g}。轮询与预警已启用。"
-        )
-        self.store.save()
-        self._record_event(
-            umo,
-            "info",
-            f"绑定成功：{label}（{'ac+elec' if 'elec' in fees else '仅 ac'}）",
-        )
-        yield event.plain_result("\n".join(lines))
+        yield event.plain_result(await self._complete_bind(umo))
+
+    @electric.command("确认")
+    async def cmd_confirm(self, event: AstrMessageEvent, code: str | None = None):
+        """提交 AI 给的确认验证码（带参=执行，不带参=看待确认项）。"""
+        if not event.is_private_chat():
+            yield event.plain_result(
+                "🔒 验证码只对发起它的私聊会话有效，请在私聊里发送 /电费 确认。"
+            )
+            return
+        umo = event.unified_msg_origin
+        if not code:
+            yield event.plain_result(self._pending_view(umo))
+            return
+        # 用户亲手敲下这条指令本身就是同意
+        token = self._bind_tokens.get(umo)
+        if token and str(code).strip() == token.get("code"):
+            token["user_ok"] = True
+        yield event.plain_result(await self._run_token(umo, str(code).strip()))
 
     @electric.command("解绑")
     async def cmd_unbind(self, event: AstrMessageEvent):
         """取消本会话的电费监控"""
-        umo = event.unified_msg_origin
-        if self.store.del_binding(umo):
-            self.store.save()
-            self._wizard.pop(umo, None)
-            self._last_raw.pop(umo, None)
-            yield event.plain_result("✅ 已解绑并停止监控。")
-        else:
-            yield event.plain_result("当前会话没有绑定。")
+        if not event.is_private_chat():
+            yield event.plain_result(GROUP_WRITE_DENIED)
+            return
+        yield event.plain_result(self._unbind(event.unified_msg_origin))
+
 
     # ================= 指令：查询 / 历史 / 日志 =================
 
