@@ -92,7 +92,7 @@ def electric():
     PLUGIN_NAME,
     "Cecilian",
     "宿舍电费余额监控预警：低余额预警、每日播报、双费种同时查询、支持 AI 对话绑定",
-    "1.1.4",
+    "1.1.5",
 
 )
 class DormElectricPlugin(Star):
@@ -1010,7 +1010,11 @@ class DormElectricPlugin(Star):
 
     # ================= AI 对话：确认验证码 =================
 
-    _ACTION_LABEL: ClassVar[dict[str, str]] = {"bind": "绑定", "unbind": "解绑"}
+    _ACTION_LABEL: ClassVar[dict[str, str]] = {
+        "bind": "绑定",
+        "unbind": "解绑",
+        "rebind": "改绑",
+    }
 
 
     def _ai_enabled(self) -> bool:
@@ -1094,6 +1098,16 @@ class DormElectricPlugin(Star):
         if token["action"] == "unbind":
             text = self._unbind(umo)
             self._record_event(umo, "ai", f"用户确认解绑：{text}")
+            return text
+        if token["action"] == "rebind":
+            self._wizard.setdefault(umo, {}).update(token.get("wizard") or {})
+            text = await self._complete_bind(umo)
+            prev = str(token.get("prev_label", ""))
+            if prev and text.startswith("✅ 绑定成功："):
+                text = f"✅ 已改绑（原 {prev}）：" + text[len("✅ 绑定成功："):]
+            self._record_event(
+                umo, "ai", f"用户确认改绑：{prev} → {token.get('label', '')}"
+            )
             return text
         # 把 issue 时快照的层级写回向导：期间 AI 可能又调了 browse/pick
         self._wizard.setdefault(umo, {}).update(token.get("wizard") or {})
@@ -1239,8 +1253,12 @@ class DormElectricPlugin(Star):
         hint 直接发起，完全不需要 browse/pick；几轮之前说过的也算——对话里能找到
         房间就传，不要重新问。用户只说了「绑定」这类碎片时，工具会提示本会话
         最近定位过的房间，照它给的 hint 重调即可。楼栋名以工具返回为准，不要臆造。
+        已绑定时传一个不同的房间就是「改绑」：同样只发一个确认码，确认后
+        原房间的历史与预警状态清零、开始监控新房间。传回同一个房间会被拒绝。
         只有完全说不出房间信息时，才用 browse/pick 逐级选到房间列表，
         再把列表里带编号那行的编号传给 room_no。
+        凭证（JSESSIONID）这类密钥永远不要向用户索要、不要转述或保存：
+        用户自己贴出来时，让他私下发送 /电费 凭证 JSESSIONID=… 更新。
 
         Args:
             room_no(int): 仅当已用 browse/pick 走到房间列表时，列表里带编号那行的编号
@@ -1252,12 +1270,7 @@ class DormElectricPlugin(Star):
             return GROUP_WRITE_DENIED
         umo = event.unified_msg_origin
         binding = self.store.get_binding(umo) if self.store else None
-        if binding:
-            return (
-                f"当前已绑定 {self._binding_label(binding)}，改绑要先解绑：\n"
-                "请调用 dorm_electric_unbind() 拿到解绑验证码，用户回复确认后，"
-                "再用本工具（hint 或 room_no）发起新绑定。"
-            )
+        prev_label = self._binding_label(binding) if binding else ""
         wizard = self._wizard_state(umo)
         snapshot: dict
         label: str
@@ -1303,10 +1316,44 @@ class DormElectricPlugin(Star):
                 "step": "bind",
             }
             label = str(w.get("room", {}).get("room", ""))
+        room_id = (snapshot.get("room") or {}).get("roomid")
         pending = self._bind_tokens.get(umo)
+        if binding:
+            bound_id = (binding.get("params", {}).get("room") or {}).get("roomid")
+            if room_id is not None and bound_id == room_id:
+                return (
+                    f"当前已绑定 {prev_label}（就是这个房间），无需重复绑定或改绑。"
+                )
+            if (
+                pending
+                and pending.get("action") == "rebind"
+                and ((pending.get("wizard") or {}).get("room") or {}).get("roomid")
+                == room_id
+            ):
+                return f"改绑到 {label} 的验证码仍是 {pending['code']}，请让用户回复这个验证码。"
+            token = self._issue_token(
+                umo,
+                "rebind",
+                room_no=index,
+                label=label,
+                wizard=snapshot,
+                prev_label=prev_label,
+            )
+            await event.send(
+                MessageChain().message(
+                    f"🔄 待改绑：{prev_label}\n→ {label}\n"
+                    f"确认码：{token['code']}（{self._token_ttl() // 60} 分钟内有效，一次性）\n"
+                    f"确认后我会改为监控新房间（原房间的历史与预警状态清零）。"
+                    f"回复 {CODE_LENGTH} 位确认码即可。"
+                )
+            )
+            return (
+                f"已向用户发出从 {prev_label} 改绑到 {label} 的确认码（{token['code']}）。"
+                "不要复述这串数字，等用户回复后你调用 dorm_electric_confirm(code=用户回复的码)。"
+            )
         if pending and pending.get("action") == "bind":
             old_rid = ((pending.get("wizard") or {}).get("room") or {}).get("roomid")
-            if old_rid is not None and old_rid == (snapshot.get("room") or {}).get("roomid"):
+            if old_rid is not None and old_rid == room_id:
                 return f"{label} 的绑定验证码仍是 {pending['code']}，请让用户回复这个验证码。"
         token = self._issue_token(
             umo, "bind", room_no=index, label=label, wizard=snapshot
@@ -1397,7 +1444,7 @@ class DormElectricPlugin(Star):
         """查本会话绑定宿舍的当前电费余额（空调费 + 宿舍电费），顺带告知预警线与播报设置。
 
         Args:
-            days(int): 顺便看最近几天的每日余额，0 表示只看当前余额，最大 14
+            days(int): 顺便看最近几天的每日余额，0 表示只看当前余额，最大 60
         """
         if not self._ai_enabled():
             return "电费 AI 工具已被插件配置关闭。"
@@ -1424,6 +1471,16 @@ class DormElectricPlugin(Star):
                     f"  {self._fee_name(kind)}："
                     f"{self._alert_hint(result.value, warn, critical)}"
                 )
+                stats = self._history_stats(
+                    (binding.get("history_by_fee") or {}).get(kind) or []
+                )
+                if stats and stats["per_day"] > 0:
+                    left = result.value / stats["per_day"]
+                    est = f"{left:.0f}" if left < 999 else "999+"
+                    lines.append(
+                        f"  {self._fee_name(kind)}：按最近日均 "
+                        f"{stats['per_day']:.2f}，约还能用 {est} 天"
+                    )
 
         lines.append(self._config_brief())
         mute_line = self._mute_line(umo)
@@ -1492,7 +1549,7 @@ class DormElectricPlugin(Star):
 
     def _trend_lines(self, binding: dict, days: int) -> list[str]:
         """按天余额趋势（只读历史，不写）。"""
-        days = max(1, min(14, days))
+        days = max(1, min(60, days))
         tz = self._resolve_tz(self._cfg("daily_timezone", "Asia/Shanghai"))
         lines = [f"\n📈 最近 {days} 天每日余额："]
         for kind in ("ac", "elec"):
@@ -1957,9 +2014,8 @@ class DormElectricPlugin(Star):
         return "⚠️ 学校有响应但未取到余额（见下方明细与 /电费 日志 的原始返回）"
 
     @electric.command("检查", alias={"自检"})
-    async def cmd_check(self, event: AstrMessageEvent):
-        """一次性自检：凭证是否生效、绑定是否正确、余额能否查到"""
-        umo = event.unified_msg_origin
+    async def _check_report(self, umo: str) -> str:
+        """自检报告全文：凭证三态 + 绑定摘要 + 实时查询 + 本会话事件尾部。"""
         binding = self.store.get_binding(umo) if self.store else None
         label = self._binding_label(binding) if binding else ""
 
@@ -1967,20 +2023,18 @@ class DormElectricPlugin(Star):
             bound_line = (
                 f"绑定：✅ {label}" if binding else "绑定：❌ 未绑定（/电费 绑定 开始）"
             )
-            yield event.plain_result(
+            return (
                 "🔎 电费自检\n"
                 "凭证：❌ 未配置（私聊发送 /电费 凭证 JSESSIONID=xxxx）\n"
                 f"{bound_line}"
             )
-            return
 
         if not binding:
-            yield event.plain_result(
+            return (
                 "🔎 电费自检\n"
                 "凭证：✅ 已配置（尚未验证，绑定后可验证）\n"
                 "绑定：❌ 未绑定（/电费 绑定 开始）"
             )
-            return
 
         results = await self._fetch_fees(binding)
         self._remember_raw(umo, results)
@@ -2017,7 +2071,23 @@ class DormElectricPlugin(Star):
                     f"  {when}  [{ev.get('kind', '?')}] {ev.get('text', '')}"
                 )
         self._record_event(umo, "info", f"自检：{state.split('（')[0]}")
-        yield event.plain_result("\n".join(lines))
+        return "\n".join(lines)
+
+    @filter.llm_tool(name="dorm_electric_check")
+    async def tool_dorm_electric_check(self, event: AstrMessageEvent) -> str:
+        """一次性自检：凭证状态 + 绑定摘要 + 两个费种实时查询 + 本会话最近事件。只读，群里也能用。
+
+        用户说「凭证还有效吗」「怎么没提醒我」「检查一下电费查询」这类话时调用。
+        凭证（JSESSIONID）永远不要向用户索要、不要转述或保存：用户自己贴出来时，
+        让他私下发送 /电费 凭证 JSESSIONID=… 更新。
+        """
+        if not self._ai_enabled():
+            return "电费 AI 工具已被插件配置关闭。"
+        return await self._check_report(event.unified_msg_origin)
+
+    async def cmd_check(self, event: AstrMessageEvent):
+        """一次性自检：凭证是否生效、绑定是否正确、余额能否查到"""
+        yield event.plain_result(await self._check_report(event.unified_msg_origin))
 
     # ================= 指令：绑定向导 =================
 

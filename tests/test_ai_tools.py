@@ -450,12 +450,18 @@ def test_bind_room_requires_room_list_first():
     assert "还没选到房间列表" in text
 
 
-def test_rebinding_requires_unbind_first():
-    plugin = _plugin(bindings={UMO: _binding("B-7-01")})
+def test_rebind_via_wizard_issues_single_code():
+    """已绑定时选另一个房间=一步改绑：只发一个码，确认后旧记录被替换。"""
+    plugin = _plugin(bindings={UMO: _binding("B-7-01", history=True)})
     event = _at_rooms(plugin)
     text = _call(plugin, plugin.tool_dorm_electric_bind_room(event, 5))
-    assert "改绑要先解绑" in text
-    assert plugin._bind_tokens == {}
+    assert "待改绑：校本部/春雪楼2/8层/B-7-01" in "".join(event.sent)
+    code = _user_replies(plugin)
+    text = _call(plugin, plugin.tool_dorm_electric_confirm(event, code))
+    assert "✅ 已改绑（原 校本部/春雪楼2/8层/B-7-01）：校本部/春雪楼2/8层/A-8-05" in text
+    assert plugin.store.get_binding(UMO)["room_label"].endswith("A-8-05")
+    new_history = plugin.store.get_binding(UMO)["history_by_fee"]["ac"]
+    assert len(new_history) == 1  # 旧房间 B-7-01 的历史被清零，只剩刚查的一条
 
 
 def test_confirm_binds_and_reports_balance():
@@ -561,13 +567,41 @@ def test_bind_room_hint_unknown_floor_asks_details():
     assert UMO not in plugin._bind_tokens
 
 
-def test_bind_room_hint_rebinding_requires_unbind():
+def test_bind_room_hint_rebind_one_code():
+    """已绑 A-8-17 → 说「改绑 A-8-01」→ 一个码完成换房。"""
+    plugin = _plugin(bindings={UMO: _binding()})
+    event = _FakeEvent()
+    text = _call(
+        plugin, plugin.tool_dorm_electric_bind_room(event, hint="A-8-01")
+    )
+    assert "待改绑" in "".join(event.sent)
+    assert "→ 校本部/春雪楼2/8层/A-8-01" in "".join(event.sent)
+    code = _user_replies(plugin)
+    text = _call(plugin, plugin.tool_dorm_electric_confirm(event, code))
+    assert "已改绑（原 校本部/春雪楼2/8层/A-8-17）：校本部/春雪楼2/8层/A-8-01" in text
+    assert plugin.store.get_binding(UMO)["params"]["room"]["room"] == "A-8-01"
+
+
+def test_bind_room_same_room_rejected():
+    """改绑传回同一个房间：直接拒绝，不发码。"""
     plugin = _plugin(bindings={UMO: _binding()})
     text = _call(
         plugin, plugin.tool_dorm_electric_bind_room(_FakeEvent(), hint="A-8-17")
     )
-    assert "改绑要先解绑" in text
+    assert "就是这个房间" in text
     assert UMO not in plugin._bind_tokens
+
+
+def test_bind_room_hint_rebind_group_denied():
+    plugin = _plugin(bindings={UMO: _binding()})
+    text = _call(
+        plugin,
+        plugin.tool_dorm_electric_bind_room(
+            _FakeEvent(GROUP_UMO, private=False), hint="A-8-01"
+        ),
+    )
+    assert text == GROUP_WRITE_DENIED
+    assert GROUP_UMO not in plugin._bind_tokens
 
 
 def test_bind_room_hint_keeps_existing_wizard_progress():
@@ -1274,3 +1308,44 @@ def test_keyword_reply_completes_bind_end_to_end():
     )
     text = _call(plugin, plugin.tool_dorm_electric_confirm(event, _code_of(plugin)))
     assert "✅ 绑定成功：校本部/春雪楼2/8层/A-8-17" in text
+
+# ================= v1.1.5：撑几天 / 历史上限 / check 工具 =================
+
+
+def test_balance_estimates_days_left():
+    plugin = _plugin(bindings={UMO: _binding(history=True)})
+    text = _call(plugin, plugin.tool_dorm_electric_balance(_FakeEvent()))
+    assert "约还能用" in text
+
+
+def test_balance_without_history_has_no_days_left():
+    plugin = _plugin(bindings={UMO: _binding()})
+    text = _call(plugin, plugin.tool_dorm_electric_balance(_FakeEvent()))
+    assert "约还能用" not in text
+
+
+def test_trend_days_capped_at_sixty():
+    plugin = _plugin(bindings={UMO: _binding(history=True)})
+    lines = plugin._trend_lines(plugin.store.get_binding(UMO), 100)
+    assert "最近 60 天" in lines[0]
+
+
+def test_check_tool_renders_and_is_readonly_in_group():
+    plugin = _plugin(bindings={GROUP_UMO: _binding(history=True)})
+    before = len(plugin._events)
+    text = _call(
+        plugin, plugin.tool_dorm_electric_check(_FakeEvent(GROUP_UMO, private=False))
+    )
+    assert "🔎 电费自检" in text
+    assert "实时查询" in text
+    assert "SECRET" not in text
+    # 事件按 umo 过滤：群会话看不到私聊事件，且自检事件记在群会话名下
+    assert all(
+        ev["umo"] == GROUP_UMO for ev in list(plugin._events)[before:]
+    )
+
+
+def test_check_tool_reports_credential_missing():
+    plugin = _plugin(bindings={UMO: _binding()}, hjnu_cookie="")
+    text = _call(plugin, plugin.tool_dorm_electric_check(_FakeEvent()))
+    assert "凭证：❌ 未配置" in text
