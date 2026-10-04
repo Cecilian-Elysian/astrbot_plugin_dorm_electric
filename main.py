@@ -83,7 +83,8 @@ def electric():
     PLUGIN_NAME,
     "Cecilian",
     "宿舍电费余额监控预警：低余额预警、每日播报、双费种同时查询、支持 AI 对话绑定",
-    "1.1.0",
+    "1.1.1",
+
 )
 class DormElectricPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -1203,53 +1204,81 @@ class DormElectricPlugin(Star):
 
     @filter.llm_tool(name="dorm_electric_bind_room")
     async def tool_dorm_electric_bind_room(
-        self, event: AstrMessageEvent, room_no: int = 0
+        self, event: AstrMessageEvent, room_no: int = 0, hint: str = ""
     ) -> str:
-        """选定房间并向用户发一个确认验证码（此时还没真正绑定）。
+        """选定房间并向用户发一个绑定确认码（此时还没真正绑定）。
+
+        用户说过房间信息（例如「春雪楼2 8层 A817」）时，把原话传给 hint 直接发起，
+        完全不需要 browse/pick；只有用户说不出房间信息时，才用 browse/pick
+        逐级选到房间列表，再把列表里带编号那行的编号传给 room_no。
 
         Args:
-            room_no(int): 房间在 dorm_electric_browse 房间列表里的编号（全楼层绝对编号）
+            room_no(int): 仅当已用 browse/pick 走到房间列表时，列表里带编号那行的编号
+            hint(string): 用户提到的房间原话，如「春雪楼2 8层 A817」「A-8-17」；传了它就不需要 room_no
         """
         if not self._ai_enabled():
             return "电费 AI 工具已被插件配置关闭。"
         if not event.is_private_chat():
             return GROUP_WRITE_DENIED
         umo = event.unified_msg_origin
-        wizard = self._wizard_state(umo)
-        # step 为 room 是刚看到列表；为 bind 是已选好房间但还没确认
-        if self._step(umo) not in ("room", "bind") or not wizard.get("rooms"):
-            return "还没选到房间列表，请先调用 dorm_electric_browse() 逐级选到房间。"
-        rooms = wizard["rooms"]
-        index, err = self._as_index(
-            room_no, len(rooms), f"房间编号无效：本层共 {len(rooms)} 间，有效编号 1-{len(rooms)}"
-        )
-        if err:
-            return err
-        self._room_listing(umo, index)
-        label = self._wizard_state(umo).get("room", {}).get("room", "")
-        pending = self._bind_tokens.get(umo)
-        if pending and pending.get("action") == "bind" and pending.get("room_no") == index:
-            return f"{label} 的绑定验证码仍是 {pending['code']}，请让用户回复这个验证码。"
         binding = self.store.get_binding(umo) if self.store else None
         if binding:
             return (
                 f"当前已绑定 {self._binding_label(binding)}，改绑要先解绑：\n"
                 "请调用 dorm_electric_unbind() 拿到解绑验证码，用户回复确认后，"
-                "再从 browse/pick 走到这个房间并调用本工具完成新绑定。"
+                "再用本工具（hint 或 room_no）发起新绑定。"
             )
-        token = self._issue_token(
-            umo,
-            "bind",
-            room_no=index,
-            label=label,
-            wizard={
-                "aid": wizard.get("aid"),
-                "area": wizard.get("area"),
-                "building": wizard.get("building"),
-                "floor": wizard.get("floor"),
-                "room": wizard.get("room"),
+        wizard = self._wizard_state(umo)
+        snapshot: dict
+        label: str
+        index = 0
+        if str(hint or "").strip():
+            params, err = await self._resolve_room(umo, hint)
+            if err:
+                return err
+            assert params
+            snapshot = {**params, "step": "bind"}
+            label = "/".join(
+                str(params[scope].get(key, ""))
+                for scope, key in (
+                    ("area", "areaname"),
+                    ("building", "building"),
+                    ("floor", "floor"),
+                    ("room", "room"),
+                )
+            )
+        else:
+            # step 为 room 是刚看到列表；为 bind 是已选好房间但还没确认
+            if self._step(umo) not in ("room", "bind") or not wizard.get("rooms"):
+                return (
+                    "还没选到房间列表，用户也没说房间号：优先在对话里问出房间"
+                    "（如「春雪楼2 8层 A817」）后用 hint 直接发起，"
+                    "或调用 dorm_electric_browse() 逐级选到房间。"
+                )
+            rooms = wizard["rooms"]
+            index, err = self._as_index(
+                room_no, len(rooms), f"房间编号无效：本层共 {len(rooms)} 间，有效编号 1-{len(rooms)}"
+            )
+            if err:
+                return err
+            self._room_listing(umo, index)
+            w = self._wizard_state(umo)
+            snapshot = {
+                "aid": w.get("aid"),
+                "area": w.get("area"),
+                "building": w.get("building"),
+                "floor": w.get("floor"),
+                "room": w.get("room"),
                 "step": "bind",
-            },
+            }
+            label = str(w.get("room", {}).get("room", ""))
+        pending = self._bind_tokens.get(umo)
+        if pending and pending.get("action") == "bind":
+            old_rid = ((pending.get("wizard") or {}).get("room") or {}).get("roomid")
+            if old_rid is not None and old_rid == (snapshot.get("room") or {}).get("roomid"):
+                return f"{label} 的绑定验证码仍是 {pending['code']}，请让用户回复这个验证码。"
+        token = self._issue_token(
+            umo, "bind", room_no=index, label=label, wizard=snapshot
         )
         await event.send(
             MessageChain().message(
@@ -1262,6 +1291,7 @@ class DormElectricPlugin(Star):
             f"已向用户直接发出 {label} 的确认码（{token['code']}）。"
             "不要复述这串数字，等用户回复后你调用 dorm_electric_confirm(code=用户回复的码)。"
         )
+
 
     @filter.llm_tool(name="dorm_electric_unbind")
     async def tool_dorm_electric_unbind(self, event: AstrMessageEvent) -> str:

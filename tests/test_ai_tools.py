@@ -475,6 +475,103 @@ def test_confirm_survives_intervening_browse():
     assert "A-8-05" in text
 
 
+# ================= hint 直连绑定（一句话定位房间，不走向导） =================
+
+
+def test_bind_room_hint_skips_wizard_and_sends_code():
+    plugin = _plugin()
+    event = _FakeEvent()
+    text = _call(
+        plugin, plugin.tool_dorm_electric_bind_room(event, hint="春雪楼2 8层 A-8-17")
+    )
+    assert "不要复述" in text
+    assert "校本部/春雪楼2/8层/A-8-17" in event.sent[0]
+    assert _code_of(plugin) in event.sent[0]
+    token = plugin._bind_tokens[UMO]
+    assert token["action"] == "bind"
+    assert token["wizard"]["step"] == "bind"
+    assert token["wizard"]["room"]["room"] == "A-8-17"
+    assert token["wizard"]["building"]["building"] == "春雪楼2"
+    assert plugin._step(UMO) == ""  # 向导全程没被碰到
+
+
+def test_bind_room_hint_full_chain_binds_and_matches_elec():
+    """「我住 A817」→ 发码 → 用户回码 → 绑定成功 + 电费自动关联。"""
+    plugin = _plugin()
+    event = _FakeEvent()
+    _call(plugin, plugin.tool_dorm_electric_bind_room(event, hint="A-8-17"))
+    code = _user_replies(plugin)
+    text = _call(plugin, plugin.tool_dorm_electric_confirm(event, code))
+    assert "✅ 绑定成功：校本部/春雪楼2/8层/A-8-17" in text
+    binding = plugin.store.get_binding(UMO)
+    assert "elec" in binding["fees"]
+    assert UMO not in plugin._bind_tokens
+
+
+def test_bind_room_hint_same_room_reminds_old_code():
+    plugin = _plugin()
+    event = _FakeEvent()
+    _call(plugin, plugin.tool_dorm_electric_bind_room(event, hint="A-8-17"))
+    first = _code_of(plugin)
+    text = _call(
+        plugin, plugin.tool_dorm_electric_bind_room(event, hint="春雪楼2 8层 A817")
+    )
+    assert _code_of(plugin) == first
+    assert "仍是" in text
+    assert len(event.sent) == 1  # 不重复骚扰用户
+
+
+def test_bind_room_hint_other_room_reissues():
+    plugin = _plugin()
+    event = _FakeEvent()
+    _call(plugin, plugin.tool_dorm_electric_bind_room(event, hint="A-8-01"))
+    old = _code_of(plugin)
+    _call(plugin, plugin.tool_dorm_electric_bind_room(event, hint="A-8-17"))
+    assert _code_of(plugin) != old
+
+
+def test_bind_room_hint_ambiguous_asks_user():
+    """两个楼栋同层同名房间：必须反问，绝不能默默发码。"""
+    plugin = _plugin(
+        rooms={
+            "春雪楼2": [{"room": "A-8-17", "roomid": 900}],
+            "春雪楼1": [{"room": "A-8-17", "roomid": 901}],
+        }
+    )
+    text = _call(
+        plugin, plugin.tool_dorm_electric_bind_room(_FakeEvent(), hint="8层 A817")
+    )
+    assert "找到多个匹配的房间" in text
+    assert UMO not in plugin._bind_tokens
+
+
+def test_bind_room_hint_unknown_floor_asks_details():
+    plugin = _plugin()
+    text = _call(
+        plugin, plugin.tool_dorm_electric_bind_room(_FakeEvent(), hint="C-9-99")
+    )
+    assert "没有 9 层" in text
+    assert UMO not in plugin._bind_tokens
+
+
+def test_bind_room_hint_rebinding_requires_unbind():
+    plugin = _plugin(bindings={UMO: _binding()})
+    text = _call(
+        plugin, plugin.tool_dorm_electric_bind_room(_FakeEvent(), hint="A-8-17")
+    )
+    assert "改绑要先解绑" in text
+    assert UMO not in plugin._bind_tokens
+
+
+def test_bind_room_hint_keeps_existing_wizard_progress():
+    """用户逛了一半向导又直接报房间号：向导进度不该被 hint 破坏。"""
+    plugin = _plugin()
+    event = _FakeEvent()
+    _at_rooms(plugin)  # 向导已走到房间层
+    _call(plugin, plugin.tool_dorm_electric_bind_room(event, hint="A-8-17"))
+    assert plugin._step(UMO) == "room"  # 仍在房间列表，没被写坏
+
+
 def test_unbind_then_confirm_removes_binding():
     plugin = _plugin(bindings={UMO: _binding()})
     event = _FakeEvent()
