@@ -182,6 +182,8 @@ def _plugin(bindings=None, ac=94.66, rooms=None, **cfg) -> DormElectricPlugin:
     plugin._bind_tokens = {}
     plugin._lookup_cache = {}
     plugin._last_room = {}
+    plugin._alert_muted = {}
+    plugin._pending_alerts = {}
     return plugin
 
 
@@ -249,13 +251,17 @@ def test_listener_marks_user_ok_on_bare_code():
     ],
 )
 def test_listener_ignores_code_embedded_in_a_sentence(message):
-    """群里问「481526 度电够吗」不能被当成已同意。"""
+    """群里任何嵌在句子里的码（含带「确认」关键词）都不算同意。"""
     plugin = _plugin()
     plugin._issue_token(UMO, "bind", label="A-8-17")
     _call(
         plugin,
         plugin.on_user_replied_code(
-            _FakeEvent(UMO, message=message.format(code=_code_of(plugin)))
+            _FakeEvent(
+                GROUP_UMO,
+                private=False,
+                message=message.format(code=_code_of(plugin)),
+            )
         ),
     )
     assert plugin._bind_tokens[UMO]["user_ok"] is False
@@ -579,7 +585,7 @@ def test_unbind_then_confirm_removes_binding():
     assert "不要复述" in _call(plugin, plugin.tool_dorm_electric_unbind(event))
     code = _user_replies(plugin)
     assert _call(plugin, plugin.tool_dorm_electric_confirm(event, code)) == (
-        "✅ 已解绑并停止监控。"
+        "✅ 已解绑并停止监控。\n要再绑定，直接说房间号即可，例如「春雪楼817」。"
     )
     assert plugin.store.get_binding(UMO) is None
 
@@ -1103,3 +1109,168 @@ def test_credential_hint_never_echoes_value():
     plugin = _plugin()
     assert "SECRET" not in CREDENTIAL_HINT
     assert plugin.config["hjnu_cookie"] == "JSESSIONID=SECRET"
+
+# ================= 预警静音（v1.1.4） =================
+
+
+def test_mute_tool_sets_and_reports_status():
+    plugin = _plugin()
+    event = _FakeEvent()
+    text = _call(plugin, plugin.tool_dorm_electric_mute_alerts(event, 24))
+    assert "已静音余额预警 24 小时" in text
+    assert plugin._alert_muted[UMO] > time.time()
+    status = _call(plugin, plugin.tool_dorm_electric_mute_alerts(event, 0))
+    assert "静音中" in status
+
+
+def test_mute_tool_clear_and_double_clear():
+    plugin = _plugin()
+    event = _FakeEvent()
+    _call(plugin, plugin.tool_dorm_electric_mute_alerts(event, 24))
+    text = _call(plugin, plugin.tool_dorm_electric_mute_alerts(event, -1))
+    assert "已恢复余额预警" in text
+    assert UMO not in plugin._alert_muted
+    again = _call(plugin, plugin.tool_dorm_electric_mute_alerts(event, -1))
+    assert "没有静音" in again
+
+
+def test_mute_tool_caps_hours_at_168():
+    plugin = _plugin()
+    text = _call(plugin, plugin.tool_dorm_electric_mute_alerts(_FakeEvent(), 1000))
+    assert "静音余额预警 168 小时" in text
+
+
+def test_mute_tool_group_denied():
+    plugin = _plugin()
+    text = _call(
+        plugin,
+        plugin.tool_dorm_electric_mute_alerts(
+            _FakeEvent(GROUP_UMO, private=False), 24
+        ),
+    )
+    assert text == GROUP_WRITE_DENIED
+    assert GROUP_UMO not in plugin._alert_muted
+
+
+def test_muted_evaluation_enqueues_nothing_and_recovers():
+    """静音期间轮询不产生预警；解除后同一条低余额立刻恢复预警（state 没被污染）。"""
+    plugin = _plugin(bindings={UMO: _binding()})
+    binding = plugin.store.get_binding(UMO)
+    _call(plugin, plugin.tool_dorm_electric_mute_alerts(_FakeEvent(), 24))
+    _call(plugin, plugin._evaluate_alerts(UMO, binding, 3.0, "ac"))
+    assert plugin._pending_alerts.get(UMO) is None
+    _call(plugin, plugin.tool_dorm_electric_mute_alerts(_FakeEvent(), -1))
+    _call(plugin, plugin._evaluate_alerts(UMO, binding, 3.0, "ac"))
+    assert plugin._pending_alerts[UMO]
+
+
+def test_flush_alerts_carries_mute_hint():
+    plugin = _plugin(bindings={UMO: _binding()})
+    sent: list[tuple[str, str]] = []
+
+    async def _capture(umo, text):
+        sent.append((umo, text))
+        return True
+
+    plugin._send = _capture
+    binding = plugin.store.get_binding(UMO)
+    _call(plugin, plugin._evaluate_alerts(UMO, binding, 8.0, "ac"))
+    _call(plugin, plugin._flush_alerts())
+    assert len(sent) == 1
+    assert "静音" in sent[0][1] and "/电费 静音" in sent[0][1]
+
+
+def test_cmd_mute_flow():
+    plugin = _plugin()
+    event = _FakeEvent()
+
+    async def _run():
+        texts = []
+        async for r in plugin.cmd_mute(event, "24"):
+            texts.append(r)
+        async for r in plugin.cmd_mute(event):
+            texts.append(r)
+        async for r in plugin.cmd_mute(event, "取消"):
+            texts.append(r)
+        async for r in plugin.cmd_mute(event, "abc"):
+            texts.append(r)
+        return texts
+
+    texts = asyncio.run(_run())
+    assert "已静音余额预警 24 小时" in texts[0]
+    assert "预警静音中" in texts[1]
+    assert "已恢复余额预警" in texts[2]
+    assert "用法" in texts[3]
+
+
+def test_cmd_mute_group_denied():
+    plugin = _plugin()
+    event = _FakeEvent(GROUP_UMO, private=False)
+
+    async def _run():
+        return [r async for r in plugin.cmd_mute(event, "24")]
+
+    assert asyncio.run(_run()) == [GROUP_WRITE_DENIED]
+
+
+def test_balance_shows_mute_line():
+    plugin = _plugin(bindings={UMO: _binding()})
+    _call(plugin, plugin.tool_dorm_electric_mute_alerts(_FakeEvent(), 24))
+    text = _call(plugin, plugin.tool_dorm_electric_balance(_FakeEvent()))
+    assert "预警静音中" in text
+
+
+# ================= 确认码私聊放宽（v1.1.4） =================
+
+
+@pytest.mark.parametrize(
+    "template",
+    ["确认 {code}", "验证码是{code}", "码：{code}。", "好，确认 {code}"],
+)
+def test_listener_accepts_keyword_forms_in_private(template):
+    plugin = _plugin()
+    plugin._issue_token(UMO, "bind", label="A-8-17")
+    _call(
+        plugin,
+        plugin.on_user_replied_code(
+            _FakeEvent(UMO, message=template.format(code=_code_of(plugin)))
+        ),
+    )
+    assert plugin._bind_tokens[UMO]["user_ok"] is True
+
+
+def test_listener_keyword_with_wrong_code_ignored():
+    plugin = _plugin()
+    plugin._issue_token(UMO, "bind", label="A-8-17")
+    _call(
+        plugin,
+        plugin.on_user_replied_code(_FakeEvent(UMO, message="确认 000000")),
+    )
+    assert plugin._bind_tokens[UMO]["user_ok"] is False
+
+
+def test_listener_keyword_with_trailing_digits_ignored():
+    """「确认 481526123」这种数字粘连不算（防手滑多敲一位变误同意）。"""
+    plugin = _plugin()
+    plugin._issue_token(UMO, "bind", label="A-8-17")
+    _call(
+        plugin,
+        plugin.on_user_replied_code(
+            _FakeEvent(UMO, message=f"确认 {_code_of(plugin)}123")
+        ),
+    )
+    assert plugin._bind_tokens[UMO]["user_ok"] is False
+
+
+def test_keyword_reply_completes_bind_end_to_end():
+    plugin = _plugin()
+    event = _FakeEvent()
+    _call(plugin, plugin.tool_dorm_electric_bind_room(event, hint="A-8-17"))
+    _call(
+        plugin,
+        plugin.on_user_replied_code(
+            _FakeEvent(UMO, message=f"验证码是 {_code_of(plugin)}")
+        ),
+    )
+    text = _call(plugin, plugin.tool_dorm_electric_confirm(event, _code_of(plugin)))
+    assert "✅ 绑定成功：校本部/春雪楼2/8层/A-8-17" in text

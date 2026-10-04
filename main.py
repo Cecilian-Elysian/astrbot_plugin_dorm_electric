@@ -50,6 +50,9 @@ ROOM_PAGE_SIZE = 30
 # 待确认项的验证码位数与默认有效期（秒），可被 ai_bind_code_ttl 覆盖。
 CODE_LENGTH = 6
 
+# 预警静音上限（小时）：「静音」只影响提醒推送，随时可逆，不需要验证码。
+ALERT_MUTE_MAX_HOURS = 168
+
 # 群聊是只读的：绑定/解绑会改「群」这份绑定，会影响到群里所有人。
 GROUP_WRITE_DENIED = (
     "群聊里不能绑定或解绑（会影响到群里所有人）。\n"
@@ -60,6 +63,10 @@ GROUP_WRITE_DENIED = (
 # 用户回复验证码时的严格格式：整条消息里除了标点只剩验证码。
 # 这样群里有人问「481526 度电够吗」不会被误判成已同意。
 CODE_ONLY_PATTERN = r"[\s，,。.!！?？:：]*{code}[\s，,。.!！?？:：]*"
+
+# 私聊放宽：「确认 481526」「验证码是481526」也算亲手回复。
+# 码是 6 位随机数且按会话隔离，私聊里没有误判对象；群聊仍只用上面的严格格式。
+CODE_KEYWORD_PATTERN = r"(?:确认|验证码|码)\s*[是码:：,，\s]*{code}(?!\d)"
 
 CREDENTIAL_HINT = (
     "🔐 学校系统凭证已失效或尚未配置。\n"
@@ -85,7 +92,7 @@ def electric():
     PLUGIN_NAME,
     "Cecilian",
     "宿舍电费余额监控预警：低余额预警、每日播报、双费种同时查询、支持 AI 对话绑定",
-    "1.1.3",
+    "1.1.4",
 
 )
 class DormElectricPlugin(Star):
@@ -107,6 +114,8 @@ class DormElectricPlugin(Star):
         # 会话内最近定位成功的房间：umo → {"params":…, "label":…, "at":…}
         # 用户说「绑定」「春雪」这类碎片时，提示 AI 用记忆里的房间重调，不再反复反问
         self._last_room: dict[str, dict] = {}
+        # 预警静音：umo → 静音截止时间戳。只影响提醒推送（内存态，重启清空）
+        self._alert_muted: dict[str, float] = {}
 
     # ================= 生命周期 =================
 
@@ -162,6 +171,7 @@ class DormElectricPlugin(Star):
         self._bind_tokens.clear()
         self._lookup_cache.clear()
         self._last_room.clear()
+        self._alert_muted.clear()
 
     # ================= 工具方法 =================
 
@@ -459,6 +469,8 @@ class DormElectricPlugin(Star):
         self, umo: str, binding: dict, value: float, kind: str = "ac", unit: str = "度"
     ):
         """评估预警：仅更新 state 与 pending_alerts，由 _flush_alerts 统一发送。"""
+        if float(self._alert_muted.get(umo, 0) or 0) > time.time():
+            return
         warn = self._cfg_float("threshold_warn", 10)
         critical = self._cfg_float("threshold_critical", 5)
         cooldown = self._cfg_float("alert_cooldown_hours", 24) * 3600
@@ -548,6 +560,8 @@ class DormElectricPlugin(Star):
                 lines.append("请立即充值。")
             elif not has_recovery:
                 lines.append("建议尽快充值。")
+            if not has_recovery:
+                lines.append("（说「静音 24小时」或发 /电费 静音 可暂停提醒）")
             await self._send(umo, "\n".join(lines))
             self._record_event(
                 umo,
@@ -942,7 +956,7 @@ class DormElectricPlugin(Star):
             self.store.save()
             self._wizard.pop(umo, None)
             self._last_raw.pop(umo, None)
-            return "✅ 已解绑并停止监控。"
+            return "✅ 已解绑并停止监控。\n要再绑定，直接说房间号即可，例如「春雪楼817」。"
         return "当前会话没有绑定。"
 
     async def _complete_bind(self, umo: str) -> str:
@@ -1101,9 +1115,16 @@ class DormElectricPlugin(Star):
         if not token or token.get("user_ok"):
             return
         text = str(getattr(event, "message_str", "") or "").strip()
-        if not text or not re.fullmatch(
-            CODE_ONLY_PATTERN.format(code=re.escape(token["code"])), text
-        ):
+        if not text:
+            return
+        code = re.escape(token["code"])
+        # 私聊放宽：带「确认/验证码/码」关键词且数字与待确认码一致也算亲手回复。
+        # 码是 6 位随机数、按会话隔离，私聊没有误判对象；群聊维持严格格式。
+        bare_ok = bool(re.fullmatch(CODE_ONLY_PATTERN.format(code=code), text))
+        keyword_ok = event.is_private_chat() and bool(
+            re.search(CODE_KEYWORD_PATTERN.format(code=code), text)
+        )
+        if not (bare_ok or keyword_ok):
             return
         token["user_ok"] = True
         self._record_event(
@@ -1405,9 +1426,69 @@ class DormElectricPlugin(Star):
                 )
 
         lines.append(self._config_brief())
+        mute_line = self._mute_line(umo)
+        if mute_line:
+            lines.append(mute_line)
         if days:
             lines.extend(self._trend_lines(binding, int(days)))
         return "\n".join(lines)
+
+    def _mute_until_text(self, umo: str) -> str:
+        """静音截止时间（本地时区文案）；未静音返回空串。"""
+        until = float(self._alert_muted.get(umo, 0) or 0)
+        if until <= time.time():
+            return ""
+        tz = self._resolve_tz(self._cfg("daily_timezone", "Asia/Shanghai"))
+        return datetime.fromtimestamp(until, tz).strftime("%m-%d %H:%M")
+
+    def _mute_line(self, umo: str) -> str:
+        """静音状态行（静音中才输出），供 balance / 自检复用。"""
+        when = self._mute_until_text(umo)
+        return f"🔕 预警静音中：{when} 前不再推送余额预警" if when else ""
+
+    def _mute_set(self, umo: str, hours: float) -> str:
+        hours = max(1.0, min(float(hours), float(ALERT_MUTE_MAX_HOURS)))
+        self._alert_muted[umo] = time.time() + hours * 3600
+        self._record_event(umo, "info", f"预警静音 {hours:g} 小时")
+        return (
+            f"🔕 已静音余额预警 {hours:g} 小时（至 {self._mute_until_text(umo)}）。"
+            "期间余额再低也不会提醒，查询、绑定、每日播报照常；"
+            "随时发 /电费 静音 0 恢复。"
+        )
+
+    def _mute_clear(self, umo: str) -> str:
+        if self._alert_muted.pop(umo, None) is None:
+            return "当前没有静音中的预警。"
+        self._record_event(umo, "info", "解除预警静音")
+        return "🔔 已恢复余额预警。"
+
+    @filter.llm_tool(name="dorm_electric_mute_alerts")
+    async def tool_dorm_electric_mute_alerts(
+        self, event: AstrMessageEvent, hours: float = 0
+    ) -> str:
+        """暂停或恢复本会话的余额预警推送（每日播报、查询、绑定都不受影响）。
+
+        用户说「别再提醒了」「静音 24 小时」「烦死了别报了」这类话时调用。
+        静音不需要验证码（只影响提醒、随时可逆），但仅限私聊操作。
+
+        Args:
+            hours(number): 大于 0 = 静音 N 小时（上限 168）；0 = 只查当前状态；-1 = 解除静音
+        """
+        if not self._ai_enabled():
+            return "电费 AI 工具已被插件配置关闭。"
+        umo = event.unified_msg_origin
+        if hours > 0:
+            if not event.is_private_chat():
+                return GROUP_WRITE_DENIED
+            return self._mute_set(umo, hours)
+        if hours < 0:
+            if not event.is_private_chat():
+                return GROUP_WRITE_DENIED
+            return self._mute_clear(umo)
+        when = self._mute_until_text(umo)
+        if when:
+            return f"🔕 预警静音中，至 {when}。期间查询、绑定、每日播报照常。"
+        return "🔔 当前没有静音，余额低于预警线会照常推送。"
 
     def _trend_lines(self, binding: dict, days: int) -> list[str]:
         """按天余额趋势（只读历史，不写）。"""
@@ -1802,6 +1883,7 @@ class DormElectricPlugin(Star):
             "/电费 房间 <编号> — 按全楼层绝对编号选择房间\n"
             "/电费 绑定 1 — 确认绑定\n"
             "/电费 确认 [验证码] — 提交 AI 给的确认码（不带参数则查看待确认项）\n"
+            "/电费 静音 [小时] — 暂停余额预警（0 或 取消=恢复；仅私聊）\n"
             "/电费 解绑 — 取消监控（仅私聊）\n"
             "/电费 查询 — 同时查询空调费和宿舍电费\n"
             "/电费 凭证 <JSESSIONID=...> — 更新会话凭证（仅限私聊，热更新）\n"
@@ -1912,8 +1994,11 @@ class DormElectricPlugin(Star):
             + "（已关联："
             + "、".join(self._fee_name(kind) for kind in fees)
             + "）",
-            "实时查询：",
         ]
+        mute_line = self._mute_line(umo)
+        if mute_line:
+            lines.append(mute_line)
+        lines.append("实时查询：")
         lines.extend(
             "  " + line
             for line in self._format_fee_results(results, include_missing=True)
@@ -2014,6 +2099,34 @@ class DormElectricPlugin(Star):
         if token and str(code).strip() == token.get("code"):
             token["user_ok"] = True
         yield event.plain_result(await self._run_token(umo, str(code).strip()))
+
+    @electric.command("静音")
+    async def cmd_mute(self, event: AstrMessageEvent, arg: str | None = None):
+        """暂停/恢复余额预警推送（仅私聊）：无参看状态，0/取消=恢复，N=静音 N 小时"""
+        if not event.is_private_chat():
+            yield event.plain_result(GROUP_WRITE_DENIED)
+            return
+        umo = event.unified_msg_origin
+        if arg is None:
+            when = self._mute_until_text(umo)
+            yield event.plain_result(
+                f"🔕 预警静音中，至 {when}。\n用法：/电费 静音 <小时>（0 或 取消=恢复）"
+                if when
+                else "🔔 未静音。\n用法：/电费 静音 <小时>（0 或 取消=恢复，上限 168）"
+            )
+            return
+        s = str(arg).strip()
+        if s in {"0", "取消", "解除"}:
+            yield event.plain_result(self._mute_clear(umo))
+            return
+        try:
+            hours = float(s)
+        except ValueError:
+            yield event.plain_result(
+                "用法：/电费 静音 <小时>（0 或 取消=恢复，上限 168）"
+            )
+            return
+        yield event.plain_result(self._mute_set(umo, hours))
 
     @electric.command("解绑")
     async def cmd_unbind(self, event: AstrMessageEvent):

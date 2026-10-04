@@ -142,6 +142,7 @@ def _plugin(results, cookie="JSESSIONID=abc", events=0, binding=True):
         maxlen=200,
     )
     plugin._last_raw = {}
+    plugin._alert_muted = {}
     return plugin
 
 
@@ -242,3 +243,9 @@ def test_check_event_tail_is_capped_at_five(n_events):
     assert body.count("[poll]") == min(n_events, 5)
     if n_events == 0:
         assert "（暂无事件）" in body
+
+
+def test_check_shows_mute_line():
+    plugin = _plugin({"0030000000004301": _ok(1.0)})
+    plugin._alert_muted[UMO] = time.time() + 3600
+    assert "预警静音中" in _call(plugin)
