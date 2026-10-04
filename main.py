@@ -9,9 +9,11 @@
 """
 
 import asyncio
+import difflib
 import re
 import secrets
 import time
+import unicodedata
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -83,7 +85,7 @@ def electric():
     PLUGIN_NAME,
     "Cecilian",
     "宿舍电费余额监控预警：低余额预警、每日播报、双费种同时查询、支持 AI 对话绑定",
-    "1.1.1",
+    "1.1.2",
 
 )
 class DormElectricPlugin(Star):
@@ -1214,7 +1216,7 @@ class DormElectricPlugin(Star):
 
         Args:
             room_no(int): 仅当已用 browse/pick 走到房间列表时，列表里带编号那行的编号
-            hint(string): 用户提到的房间原话，如「春雪楼2 8层 A817」「A-8-17」；传了它就不需要 room_no
+            hint(string): 用户提到的房间原话，如「春雪楼817」「春雪楼2 8层 A817」「A-8-17」；传了它就不需要 room_no
         """
         if not self._ai_enabled():
             return "电费 AI 工具已被插件配置关闭。"
@@ -1436,26 +1438,36 @@ class DormElectricPlugin(Star):
     # 房间名反查：A-8-17 / A817 / 春雪楼2 8层 A817
     HINT_ROOM_RE = re.compile(r"([A-Za-z]+)[-_ ]?(\d+)(?:[-_ ]?(\d+))?")
     HINT_FLOOR_RE = re.compile(r"(\d+)\s*层")
+    HINT_DIGITS_RE = re.compile(r"\d{3,4}")
     LOOKUP_BUILDING_BUDGET = 12
     LOOKUP_ROOM_BUDGET = 12
 
     @classmethod
     def _parse_room_hint(cls, hint: str) -> tuple[str, str]:
-        """从口语里抽出房间 token（A817）与楼层号（8）。
+        """从口语里抽出房间 token（A817 / 817）与楼层号（8）。
 
         「A-8-17」自带楼层段；「A817」这类紧凑写法再从「8层」里捞楼层；
-        都没有就留空，由 _resolve_room 按受限的逐层搜索去找。
+        「春雪楼817」「817」这类没有字母的说法走纯数字回退，首位数字当楼层。
+        全角数字先 NFKC 归一。都没有就留空，由 _resolve_room 按受限的逐层搜索去找。
         """
-        text = str(hint or "")
+        text = unicodedata.normalize("NFKC", str(hint or ""))
         m = cls.HINT_ROOM_RE.search(text)
         if not m:
-            return "", ""
+            digits = cls.HINT_DIGITS_RE.search(text)
+            if not digits:
+                return "", ""
+            token = digits.group(0)
+            first = token[0]
+            return token, ("" if first == "0" else first)
         letters, second, third = m.groups()
         token = f"{letters}{second}{third or ''}"
         if third:
-            return token, second
+            return token, second.lstrip("0")
         floor = cls.HINT_FLOOR_RE.search(text)
-        return token, (floor.group(1) if floor else "")
+        if floor:
+            return token, floor.group(1).lstrip("0")
+        return token, ""
+
 
     async def _resolve_room(self, umo: str, hint: str) -> tuple[dict | None, str | None]:
         """按房间名反查学校侧的房间参数。返回 (ac_params, err)。
@@ -1467,8 +1479,8 @@ class DormElectricPlugin(Star):
         token, floor_no = self._parse_room_hint(hint)
         if not token:
             return None, (
-                "没认出房间号。房间号形如 A-8-17 或 A817，"
-                "也可以连楼栋一起说，例如「春雪楼2 8层 A817」。"
+                "没认出房间号。可以说「春雪楼817」「817」「A817」「A-8-17」或"
+                "「春雪楼2 8层 A817」这类格式。"
             )
         items = self.config.get("fee_items", {}) or {}
         aids = list(items)
@@ -1496,6 +1508,16 @@ class DormElectricPlugin(Star):
         named = next(
             (b for b in buildings if b.get("building") and b["building"] in text), None
         )
+        if not named:
+            # 「春雪楼817」点不出完整楼名「春雪楼2」：楼栋名去掉数字后再匹配一次
+            named = next(
+                (
+                    b
+                    for b in buildings
+                    if b.get("building") and re.sub(r"\d", "", str(b["building"])) in text
+                ),
+                None,
+            )
         if named:
             order.append(named)
         bound = self.store.get_binding(umo) if self.store else None
@@ -1517,6 +1539,13 @@ class DormElectricPlugin(Star):
             zip(order, await asyncio.gather(*(floors_of(b) for b in order)), strict=False)
         )
         pairs: list[tuple[dict, dict]] = []
+        # 「A817」这类 token 不带楼层：从去字母后的首个非零数字猜楼层，猜中的排最前
+        # （软优先，只影响扫描顺序不影响正确性；猜错就按原轮转顺序兜底）。
+        guess_floor = ""
+        if not floor_no:
+            digits_part = re.sub(r"^[A-Za-z]+", "", token)
+            g = re.search(r"[1-9]", digits_part)
+            guess_floor = g.group(0) if g else ""
         if floor_no:
             for building, floors in floors_by_building:
                 floor = next(
@@ -1530,12 +1559,33 @@ class DormElectricPlugin(Star):
                 if floor:
                     pairs.append((building, floor))
         else:
+            picked: set[tuple[str, str]] = set()
+
+            def pick(b: dict, f: dict) -> None:
+                key = (str(b.get("building")), str(f.get("floor")))
+                if key not in picked and len(pairs) < self.LOOKUP_ROOM_BUDGET:
+                    picked.add(key)
+                    pairs.append((b, f))
+
+            if guess_floor:
+                for building, floors in floors_by_building:
+                    floor = next(
+                        (
+                            f
+                            for f in floors
+                            if str(f.get("floor", "")).replace("层", "").strip()
+                            == guess_floor
+                        ),
+                        None,
+                    )
+                    if floor:
+                        pick(building, floor)
             depth = 0
             while len(pairs) < self.LOOKUP_ROOM_BUDGET:
                 added = False
                 for building, floors in floors_by_building:
                     if len(floors) > depth:
-                        pairs.append((building, floors[depth]))
+                        pick(building, floors[depth])
                         added = True
                         if len(pairs) >= self.LOOKUP_ROOM_BUDGET:
                             break
@@ -1565,17 +1615,35 @@ class DormElectricPlugin(Star):
             except QueryError:
                 return building, floor, []
 
-        hits: list[tuple[dict, dict, dict]] = []
-        for building, floor, rooms in await asyncio.gather(
-            *(rooms_of(p) for p in pairs)
-        ):
-            for room in rooms:
-                name = str(room.get("room", ""))
-                if token.lower() in re.sub(r"[^A-Za-z0-9]", "", name).lower():
-                    hits.append((building, floor, room))
-                    break
+        results = await asyncio.gather(*(rooms_of(p) for p in pairs))
+
+        def norm_name(room: dict) -> str:
+            return re.sub(r"[^A-Za-z0-9]", "", str(room.get("room", ""))).lower()
+
+        def strict_match(t: str) -> list[tuple[dict, dict, dict]]:
+            needle = re.sub(r"[^A-Za-z0-9]", "", str(t)).lower()
+            out: list[tuple[dict, dict, dict]] = []
+            for building, floor, rooms in results:
+                for room in rooms:
+                    if needle and needle in norm_name(room):
+                        out.append((building, floor, room))
+                        break
+            return out
+
+        hits = strict_match(token)
         if not hits:
-            return None, f"没找到房间号包含 {token} 的房间，请让用户确认一下房间号。"
+            # 「A-08-17」这类前导零写法：去掉数字段里的前导零再试一次
+            alt = re.sub(r"(^|[^0-9])0+(\d)", r"\1\2", token)
+            if alt != token:
+                hits = strict_match(alt)
+                if hits:
+                    token = alt
+        if not hits:
+            scanned: list[tuple[str, dict, dict, dict]] = []
+            for building, floor, rooms in results:
+                for room in rooms:
+                    scanned.append((norm_name(room), building, floor, room))
+            return None, self._fuzzy_miss_text(token, scanned)
         if len(hits) > 1:
             options = "、".join(
                 f"{b.get('building')}/{f.get('floor')}/{r.get('room')}"
@@ -1593,6 +1661,36 @@ class DormElectricPlugin(Star):
             },
             None,
         )
+
+    @staticmethod
+    def _fuzzy_miss_text(token: str, scanned: list[tuple[str, dict, dict, dict]]) -> str:
+        """严格匹配落空时的回复：有近似房间就列出来让 AI 反问，没有才回格式引导。
+
+        只在本次已扫描到的房间里算相似度（difflib，零额外请求）；永远不直接
+        采用猜测结果——候选交给用户确认后，AI 必须用完整房间名重新调用。
+        """
+        if scanned:
+            by_name: dict[str, tuple[dict, dict, dict]] = {}
+            for name, building, floor, room in scanned:
+                by_name.setdefault(name, (building, floor, room))
+            close = difflib.get_close_matches(
+                re.sub(r"[^A-Za-z0-9]", "", str(token)).lower(),
+                list(by_name),
+                n=5,
+                cutoff=0.6,
+            )
+            if close:
+                options = "、".join(
+                    f"{by_name[n][0].get('building')}/"
+                    f"{by_name[n][1].get('floor')}/{by_name[n][2].get('room')}"
+                    for n in close
+                )
+                return (
+                    f"学校里没有完全叫「{token}」的房间。最接近的是：{options}。"
+                    "请反问用户是哪一个，确认后用完整房间名重新调用。"
+                )
+        return f"没找到房间号包含 {token} 的房间，请让用户确认一下房间号。"
+
 
     async def _query_room_balance(self, umo: str, hint: str) -> str:
         params, err = await self._resolve_room(umo, hint)
@@ -1625,7 +1723,7 @@ class DormElectricPlugin(Star):
         """按房间名/编号查任意宿舍的当前电费余额，不需要绑定。
 
         Args:
-            room_hint(string): 房间号或「楼栋+楼层+房间」，例如 A-8-17、A817、春雪楼2 8层 A817
+            room_hint(string): 用户的原话直接传，例如 春雪楼817、817、A-8-17、A817、春雪楼2 8层 A817
         """
         if not self._ai_enabled():
             return "电费 AI 工具已被插件配置关闭。"

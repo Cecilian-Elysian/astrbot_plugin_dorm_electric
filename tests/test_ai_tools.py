@@ -752,6 +752,126 @@ def test_query_room_does_not_create_binding():
     assert plugin.store.data["bindings"] == {}
 
 
+# ================= 房间口令：真实说法解析 + 模糊反问（v1.1.2） =================
+
+
+@pytest.mark.parametrize(
+    "hint,expected",
+    [
+        ("春雪楼817", ("817", "8")),
+        ("817", ("817", "8")),
+        ("汉江师范学院春雪楼817", ("817", "8")),
+        ("春雪楼８１７", ("817", "8")),  # 全角数字 NFKC 归一
+        ("8楼817", ("817", "8")),
+        ("春雪楼 A-08-17", ("A0817", "8")),  # 前导零，解析层原样、匹配层去零
+        ("0817", ("0817", "")),  # 首位 0 不可当楼层，交给软猜测
+        ("A817", ("A817", "")),  # 原有路径不变
+    ],
+)
+def test_parse_room_hint_real_world_phrases(hint, expected):
+    assert DormElectricPlugin._parse_room_hint(hint) == expected
+
+
+def test_query_room_plain_building_number_hits():
+    plugin = _plugin()
+    text = _call(plugin, plugin.tool_dorm_electric_query_room(_FakeEvent(), "春雪楼817"))
+    assert "⚡ 校本部/春雪楼2/8层/A-8-17" in text
+    assert "空调费：94.66 度" in text
+    assert "宿舍电费：12.30 元" in text
+
+
+def test_query_room_bare_digits_hit():
+    plugin = _plugin()
+    text = _call(plugin, plugin.tool_dorm_electric_query_room(_FakeEvent(), "817"))
+    assert "A-8-17" in text
+
+
+def test_query_room_full_width_digits_hit():
+    plugin = _plugin()
+    text = _call(
+        plugin, plugin.tool_dorm_electric_query_room(_FakeEvent(), "春雪楼８１７")
+    )
+    assert "A-8-17" in text
+
+
+def test_query_room_leading_zero_variant_hits():
+    plugin = _plugin()
+    text = _call(
+        plugin, plugin.tool_dorm_electric_query_room(_FakeEvent(), "春雪楼 A-08-17")
+    )
+    assert "A-8-17" in text
+
+
+def test_soft_floor_guess_scans_guessed_floor_first():
+    """「A817」没说楼层：8 层要排在扫描队首，而不是轮转到第二轮才扫到。"""
+    plugin = _plugin()
+    _call(plugin, plugin.tool_dorm_electric_query_room(_FakeEvent(), "A817"))
+    room_calls = [c for c in plugin.hjnu.calls if c.startswith("rooms:")]
+    assert room_calls[:2] == [
+        "rooms:春雪楼2:8层",
+        "rooms:春雪楼1:8层",
+    ]
+
+
+def test_query_room_transposition_fuzzy_asks():
+    """「A-8-71」（17 手滑打反）：列出近似候选让 AI 反问，而不是只回格式提示。"""
+    plugin = _plugin()
+    text = _call(plugin, plugin.tool_dorm_electric_query_room(_FakeEvent(), "春雪楼 A-8-71"))
+    assert "没有完全叫「A871」" in text
+    assert "春雪楼2/8层/A-8-17" in text
+    assert "请反问用户是哪一个" in text
+
+
+def test_query_room_wrong_letter_fuzzy_suggests():
+    plugin = _plugin()
+    text = _call(plugin, plugin.tool_dorm_electric_query_room(_FakeEvent(), "春雪楼 B817"))
+    assert "没有完全叫「B817」" in text
+    assert "A-8-17" in text
+
+
+def test_query_room_dissimilar_miss_keeps_format_hint():
+    plugin = _plugin()
+    text = _call(plugin, plugin.tool_dorm_electric_query_room(_FakeEvent(), "A-8-99"))
+    assert text == "没找到房间号包含 A899 的房间，请让用户确认一下房间号。"
+
+
+def test_bind_room_fuzzy_suggests_and_never_issues_code():
+    """模糊候选绝不能直接发码：必须反问，等用户点名后用精确名重调。"""
+    plugin = _plugin()
+    text = _call(
+        plugin, plugin.tool_dorm_electric_bind_room(_FakeEvent(), hint="春雪楼 B817")
+    )
+    assert "没有完全叫「B817」" in text
+    assert "A-8-17" in text
+    assert UMO not in plugin._bind_tokens
+
+
+def test_bind_room_fuzzy_then_exact_recall_issues_code():
+    plugin = _plugin()
+    event = _FakeEvent()
+    first = _call(
+        plugin, plugin.tool_dorm_electric_bind_room(event, hint="春雪楼 A8-71")
+    )
+    assert "没有完全叫" in first
+    text = _call(
+        plugin, plugin.tool_dorm_electric_bind_room(event, hint="春雪楼2 8层 A-8-17")
+    )
+    assert "不要复述" in text
+    assert UMO in plugin._bind_tokens
+    assert plugin._bind_tokens[UMO]["wizard"]["room"]["room"] == "A-8-17"
+
+
+def test_bind_room_plain_building_number_full_chain():
+    """「春雪楼817」→ 发码 → 回码 → 绑定成功。"""
+    plugin = _plugin()
+    event = _FakeEvent()
+    _call(plugin, plugin.tool_dorm_electric_bind_room(event, hint="春雪楼817"))
+    code = _user_replies(plugin)
+    text = _call(plugin, plugin.tool_dorm_electric_confirm(event, code))
+    assert "✅ 绑定成功：校本部/春雪楼2/8层/A-8-17" in text
+    assert "elec" in plugin.store.get_binding(UMO)["fees"]
+
+
 # ================= 指令：共用选择器的回归（重构不许改行为） =================
 
 
