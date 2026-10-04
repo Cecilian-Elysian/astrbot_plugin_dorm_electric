@@ -181,6 +181,7 @@ def _plugin(bindings=None, ac=94.66, rooms=None, **cfg) -> DormElectricPlugin:
     plugin._last_raw = {}
     plugin._bind_tokens = {}
     plugin._lookup_cache = {}
+    plugin._last_room = {}
     return plugin
 
 
@@ -870,6 +871,70 @@ def test_bind_room_plain_building_number_full_chain():
     text = _call(plugin, plugin.tool_dorm_electric_confirm(event, code))
     assert "✅ 绑定成功：校本部/春雪楼2/8层/A-8-17" in text
     assert "elec" in plugin.store.get_binding(UMO)["fees"]
+
+
+# ================= 会话房间记忆：碎片说法不再反复反问（v1.1.3） =================
+
+
+def test_query_fragment_after_hit_suggests_last_room():
+    """「春雪楼817」查过之后说「春雪」：提示记忆房间让 AI 重调，而不是要格式。"""
+    plugin = _plugin()
+    event = _FakeEvent()
+    _call(plugin, plugin.tool_dorm_electric_query_room(event, "春雪楼817"))
+    text = _call(plugin, plugin.tool_dorm_electric_query_room(event, "春雪"))
+    assert "没认出房间号" in text
+    assert "定位过 校本部/春雪楼2/8层/A-8-17" in text
+    assert "hint 传「A-8-17」" in text
+    assert "不要反问" in text
+
+
+def test_bind_fragment_after_query_binds_directly():
+    """先查过 817，再说「绑定」：AI 按记忆提示重调一次就直接发码。"""
+    plugin = _plugin()
+    event = _FakeEvent()
+    _call(plugin, plugin.tool_dorm_electric_query_room(event, "春雪楼817"))
+    first = _call(plugin, plugin.tool_dorm_electric_bind_room(event, hint="绑定"))
+    assert "定位过 校本部/春雪楼2/8层/A-8-17" in first
+    assert UMO not in plugin._bind_tokens  # 提示阶段不发码
+    text = _call(plugin, plugin.tool_dorm_electric_bind_room(event, hint="A-8-17"))
+    assert "不要复述" in text
+    assert plugin._bind_tokens[UMO]["wizard"]["room"]["room"] == "A-8-17"
+
+
+def test_room_memory_expires():
+    plugin = _plugin()
+    plugin._last_room[UMO] = {
+        "params": _params(),
+        "label": f"{LABEL}/A-8-17",
+        "at": time.time() - 1801,
+    }
+    text = _call(plugin, plugin.tool_dorm_electric_query_room(_FakeEvent(), "春雪"))
+    assert "定位过" not in text
+
+
+def test_room_memory_not_poisoned_by_misses():
+    """解析失败/模糊反问不许写入记忆。"""
+    plugin = _plugin()
+    event = _FakeEvent()
+    _call(plugin, plugin.tool_dorm_electric_query_room(event, "随便聊聊"))
+    _call(plugin, plugin.tool_dorm_electric_query_room(event, "春雪楼 A-8-71"))
+    assert UMO not in plugin._last_room
+
+
+def test_room_memory_is_per_session():
+    plugin = _plugin()
+    _call(plugin, plugin.tool_dorm_electric_query_room(_FakeEvent(UMO), "春雪楼817"))
+    text = _call(
+        plugin, plugin.tool_dorm_electric_query_room(_FakeEvent(GROUP_UMO), "春雪")
+    )
+    assert "定位过" not in text
+
+
+def test_bind_hint_success_also_refreshes_memory():
+    plugin = _plugin()
+    event = _FakeEvent()
+    _call(plugin, plugin.tool_dorm_electric_bind_room(event, hint="A-8-01"))
+    assert plugin._last_room[UMO]["label"].endswith("/A-8-01")
 
 
 # ================= 指令：共用选择器的回归（重构不许改行为） =================

@@ -85,7 +85,7 @@ def electric():
     PLUGIN_NAME,
     "Cecilian",
     "宿舍电费余额监控预警：低余额预警、每日播报、双费种同时查询、支持 AI 对话绑定",
-    "1.1.2",
+    "1.1.3",
 
 )
 class DormElectricPlugin(Star):
@@ -104,6 +104,9 @@ class DormElectricPlugin(Star):
         self._bind_tokens: dict[str, dict] = {}
         # 房间名反查结果缓存：f"{umo}|{token}" → (时间戳, 文案)
         self._lookup_cache: dict[str, tuple[float, str]] = {}
+        # 会话内最近定位成功的房间：umo → {"params":…, "label":…, "at":…}
+        # 用户说「绑定」「春雪」这类碎片时，提示 AI 用记忆里的房间重调，不再反复反问
+        self._last_room: dict[str, dict] = {}
 
     # ================= 生命周期 =================
 
@@ -158,6 +161,7 @@ class DormElectricPlugin(Star):
         self._pending_alerts.clear()
         self._bind_tokens.clear()
         self._lookup_cache.clear()
+        self._last_room.clear()
 
     # ================= 工具方法 =================
 
@@ -1210,9 +1214,12 @@ class DormElectricPlugin(Star):
     ) -> str:
         """选定房间并向用户发一个绑定确认码（此时还没真正绑定）。
 
-        用户说过房间信息（例如「春雪楼2 8层 A817」）时，把原话传给 hint 直接发起，
-        完全不需要 browse/pick；只有用户说不出房间信息时，才用 browse/pick
-        逐级选到房间列表，再把列表里带编号那行的编号传给 room_no。
+        用户说过房间信息（例如「春雪楼2 8层 A817」「春雪楼817」）时，把原话传给
+        hint 直接发起，完全不需要 browse/pick；几轮之前说过的也算——对话里能找到
+        房间就传，不要重新问。用户只说了「绑定」这类碎片时，工具会提示本会话
+        最近定位过的房间，照它给的 hint 重调即可。楼栋名以工具返回为准，不要臆造。
+        只有完全说不出房间信息时，才用 browse/pick 逐级选到房间列表，
+        再把列表里带编号那行的编号传给 room_no。
 
         Args:
             room_no(int): 仅当已用 browse/pick 走到房间列表时，列表里带编号那行的编号
@@ -1256,6 +1263,7 @@ class DormElectricPlugin(Star):
                     "还没选到房间列表，用户也没说房间号：优先在对话里问出房间"
                     "（如「春雪楼2 8层 A817」）后用 hint 直接发起，"
                     "或调用 dorm_electric_browse() 逐级选到房间。"
+                    + self._last_room_line(umo)
                 )
             rooms = wizard["rooms"]
             index, err = self._as_index(
@@ -1441,6 +1449,35 @@ class DormElectricPlugin(Star):
     HINT_DIGITS_RE = re.compile(r"\d{3,4}")
     LOOKUP_BUILDING_BUDGET = 12
     LOOKUP_ROOM_BUDGET = 12
+    LAST_ROOM_TTL = 1800  # 会话房间记忆 30 分钟
+
+    def _remember_room(self, umo: str, params: dict) -> None:
+        """定位成功后记下本会话的房间，供「绑定」「春雪」这类碎片说法复用。"""
+        label = "/".join(
+            str(params[scope].get(key, ""))
+            for scope, key in (
+                ("area", "areaname"),
+                ("building", "building"),
+                ("floor", "floor"),
+                ("room", "room"),
+            )
+        )
+        self._last_room[umo] = {"params": params, "label": label, "at": time.time()}
+
+    def _last_room_line(self, umo: str) -> str:
+        """未解析出房间时的追加提示：告诉 AI 本会话最近定位过哪个房间、怎么重调。"""
+        last = self._last_room.get(umo)
+        if not last or time.time() - float(last.get("at", 0)) > self.LAST_ROOM_TTL:
+            return ""
+        room_name = (last.get("params", {}).get("room") or {}).get("room", "")
+        if not room_name:
+            return ""
+        minutes = max(1, int((time.time() - float(last["at"])) // 60))
+        return (
+            f"\n\n本会话 {minutes} 分钟前定位过 {last['label']}。"
+            f"如果用户指的就是它（比如用户刚说「绑定」「查电费」），"
+            f"直接用 hint 传「{room_name}」重新调用本工具，不要反问。"
+        )
 
     @classmethod
     def _parse_room_hint(cls, hint: str) -> tuple[str, str]:
@@ -1480,7 +1517,7 @@ class DormElectricPlugin(Star):
         if not token:
             return None, (
                 "没认出房间号。可以说「春雪楼817」「817」「A817」「A-8-17」或"
-                "「春雪楼2 8层 A817」这类格式。"
+                "「春雪楼2 8层 A817」这类格式。" + self._last_room_line(umo)
             )
         items = self.config.get("fee_items", {}) or {}
         aids = list(items)
@@ -1651,16 +1688,15 @@ class DormElectricPlugin(Star):
             )
             return None, f"找到多个匹配的房间：{options}。请反问用户是哪一个。"
         building, floor, room = hits[0]
-        return (
-            {
-                "aid": aid,
-                "area": area,
-                "building": building,
-                "floor": floor,
-                "room": room,
-            },
-            None,
-        )
+        params = {
+            "aid": aid,
+            "area": area,
+            "building": building,
+            "floor": floor,
+            "room": room,
+        }
+        self._remember_room(umo, params)
+        return params, None
 
     @staticmethod
     def _fuzzy_miss_text(token: str, scanned: list[tuple[str, dict, dict, dict]]) -> str:
@@ -1721,6 +1757,9 @@ class DormElectricPlugin(Star):
         self, event: AstrMessageEvent, room_hint: str = ""
     ) -> str:
         """按房间名/编号查任意宿舍的当前电费余额，不需要绑定。
+
+        用户只说了模糊片段（如「春雪」）时，工具会提示本会话最近定位过的房间，
+        照它给的 hint 重调即可；楼栋名以工具返回为准，不要臆造。
 
         Args:
             room_hint(string): 用户的原话直接传，例如 春雪楼817、817、A-8-17、A817、春雪楼2 8层 A817
