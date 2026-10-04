@@ -92,7 +92,7 @@ def electric():
     PLUGIN_NAME,
     "Cecilian",
     "宿舍电费余额监控预警：低余额预警、每日播报、双费种同时查询、支持 AI 对话绑定",
-    "1.1.5",
+    "1.1.6",
 
 )
 class DormElectricPlugin(Star):
@@ -465,17 +465,40 @@ class DormElectricPlugin(Star):
             )
         await self._flush_alerts()
 
+    def _effective_thresholds(self, binding: dict | None) -> tuple[float, float]:
+        """生效预警线：本会话自定义（binding.thresholds）优先，否则用全局配置。"""
+        warn = self._cfg_float("threshold_warn", 10)
+        critical = self._cfg_float("threshold_critical", 5)
+        if critical > warn:
+            warn, critical = critical, warn
+        t = (binding or {}).get("thresholds") or {}
+        try:
+            w = float(t.get("warn") or 0)
+        except (TypeError, ValueError):
+            w = 0.0
+        try:
+            c = float(t.get("critical") or 0)
+        except (TypeError, ValueError):
+            c = 0.0
+        if w > 0:
+            warn = w
+            critical = c if 0 < c <= warn else w / 2
+        return warn, critical
+
+    def _daily_muted_until(self, binding: dict | None) -> float:
+        try:
+            return float((binding or {}).get("daily_muted_until") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
     async def _evaluate_alerts(
         self, umo: str, binding: dict, value: float, kind: str = "ac", unit: str = "度"
     ):
         """评估预警：仅更新 state 与 pending_alerts，由 _flush_alerts 统一发送。"""
         if float(self._alert_muted.get(umo, 0) or 0) > time.time():
             return
-        warn = self._cfg_float("threshold_warn", 10)
-        critical = self._cfg_float("threshold_critical", 5)
+        warn, critical = self._effective_thresholds(binding)
         cooldown = self._cfg_float("alert_cooldown_hours", 24) * 3600
-        if critical > warn:
-            warn, critical = critical, warn
         if value <= critical:
             level = 2
         elif value <= warn:
@@ -592,6 +615,8 @@ class DormElectricPlugin(Star):
         today = datetime.now(tz).date().isoformat()
         bindings = self.store.data.get("bindings", {})
         for umo, binding in list(bindings.items()):
+            if self._daily_muted_until(binding) > time.time():
+                continue
             if binding.get("last_daily_date") == today:
                 continue
             text = self._daily_text(binding)
@@ -1458,10 +1483,7 @@ class DormElectricPlugin(Star):
             )
         results = await self._fetch_fees(binding)
         self._remember_raw(umo, results)
-        warn = self._cfg_float("threshold_warn", 10)
-        critical = self._cfg_float("threshold_critical", 5)
-        if critical > warn:
-            warn, critical = critical, warn
+        warn, critical = self._effective_thresholds(binding)
         lines = [f"⚡ {self._binding_label(binding)}"]
         lines.extend(self._format_fee_results(results, include_missing=True))
         for kind in ("ac", "elec"):
@@ -1483,6 +1505,16 @@ class DormElectricPlugin(Star):
                     )
 
         lines.append(self._config_brief())
+        if binding.get("thresholds"):
+            lines.append(
+                f"（本会话预警线已自定义为 {warn:g} / {critical:g}，"
+                "说「恢复默认预警线」可还原）"
+            )
+        daily_until = self._daily_muted_until(binding)
+        if daily_until > time.time():
+            tz = self._resolve_tz(self._cfg("daily_timezone", "Asia/Shanghai"))
+            when = datetime.fromtimestamp(daily_until, tz).strftime("%m-%d %H:%M")
+            lines.append(f"🔕 每日播报已静音至 {when}")
         mute_line = self._mute_line(umo)
         if mute_line:
             lines.append(mute_line)
@@ -1521,31 +1553,127 @@ class DormElectricPlugin(Star):
 
     @filter.llm_tool(name="dorm_electric_mute_alerts")
     async def tool_dorm_electric_mute_alerts(
-        self, event: AstrMessageEvent, hours: float = 0
+        self, event: AstrMessageEvent, hours: float = 0, scope: str = "alerts"
     ) -> str:
-        """暂停或恢复本会话的余额预警推送（每日播报、查询、绑定都不受影响）。
+        """暂停或恢复本会话的余额提醒（预警推送和/或每日播报），或查看静音状态。
 
-        用户说「别再提醒了」「静音 24 小时」「烦死了别报了」这类话时调用。
-        静音不需要验证码（只影响提醒、随时可逆），但仅限私聊操作。
+        用户说「别再提醒了」「静音 24 小时」「烦死了别报了」→ scope=all 或默认；
+        只嫌早上播报吵 → scope=daily。静音不需要验证码（只影响提醒、随时可逆），
+        但写操作仅限私聊。
 
         Args:
             hours(number): 大于 0 = 静音 N 小时（上限 168）；0 = 只查当前状态；-1 = 解除静音
+            scope(string): 作用范围："alerts"=只静音余额预警（默认）；"daily"=只静音每日播报；"all"=两者都静音
         """
         if not self._ai_enabled():
             return "电费 AI 工具已被插件配置关闭。"
         umo = event.unified_msg_origin
-        if hours > 0:
-            if not event.is_private_chat():
-                return GROUP_WRITE_DENIED
-            return self._mute_set(umo, hours)
-        if hours < 0:
-            if not event.is_private_chat():
-                return GROUP_WRITE_DENIED
-            return self._mute_clear(umo)
-        when = self._mute_until_text(umo)
-        if when:
-            return f"🔕 预警静音中，至 {when}。期间查询、绑定、每日播报照常。"
-        return "🔔 当前没有静音，余额低于预警线会照常推送。"
+        s = str(scope or "alerts").strip().lower()
+        scope_map = {"alerts": "alerts", "预警": "alerts", "alert": "alerts",
+                     "daily": "daily", "播报": "daily",
+                     "all": "all", "全部": "all", "都": "all"}
+        s = scope_map.get(s, "")
+        if not s:
+            return "scope 只支持 alerts（预警）/ daily（每日播报）/ all（全部）。"
+        write = hours > 0 or hours < 0
+        if write and not event.is_private_chat():
+            return GROUP_WRITE_DENIED
+
+        async def _apply_alerts() -> str:
+            if hours > 0:
+                return self._mute_set(umo, hours)
+            if hours < 0:
+                return self._mute_clear(umo)
+            when = self._mute_until_text(umo)
+            if when:
+                return f"🔕 预警静音中，至 {when}。期间查询、绑定、每日播报照常。"
+            return "🔔 预警未静音，余额低于预警线会照常推送。"
+
+        async def _apply_daily() -> str:
+            binding = self.store.get_binding(umo) if self.store else None
+            if not binding:
+                return "本会话还没有绑定宿舍，没有每日播报可静音。"
+            until = self._daily_muted_until(binding)
+            tz = self._resolve_tz(self._cfg("daily_timezone", "Asia/Shanghai"))
+            if hours > 0:
+                span = max(1.0, min(float(hours), float(ALERT_MUTE_MAX_HOURS)))
+                binding["daily_muted_until"] = time.time() + span * 3600
+                self.store.save()
+                self._record_event(umo, "info", f"每日播报静音 {span:g} 小时")
+                when = datetime.fromtimestamp(binding["daily_muted_until"], tz)
+                return f"🔕 已静音每日播报 {span:g} 小时（至 {when:%m-%d %H:%M}），预警照常。"
+            if hours < 0:
+                binding.pop("daily_muted_until", None)
+                self.store.save()
+                self._record_event(umo, "info", "恢复每日播报")
+                return "🔔 已恢复每日播报。"
+            if until > time.time():
+                when = datetime.fromtimestamp(until, tz).strftime("%m-%d %H:%M")
+                return f"🔕 每日播报静音中，至 {when}。"
+            return "🔔 每日播报正常。"
+
+        if s == "alerts":
+            return await _apply_alerts()
+        if s == "daily":
+            return await _apply_daily()
+        parts = [await _apply_alerts(), await _apply_daily()]
+        return "\n".join(parts)
+
+    @filter.llm_tool(name="dorm_electric_set_alert_threshold")
+    async def tool_dorm_electric_set_alert_threshold(
+        self, event: AstrMessageEvent, warn: float = 0, critical: float = 0
+    ) -> str:
+        """设置本会话的余额预警线（只影响这个会话的提醒，不改全局配置、不影响其他会话）。
+
+        用户说「低于 20 就提醒我」「余额少于 5 立刻告诉我」这类话时调用。
+        写操作仅限私聊。预警线只对该会话已绑定的房间生效，未绑定无法设置。
+
+        Args:
+            warn(number): 预警线：余额低于它时发预警提醒；0 = 只看当前生效值；-1 = 恢复全局默认
+            critical(number): 紧急线（低于它时发紧急提醒），可不传，默认取预警线的一半
+        """
+        if not self._ai_enabled():
+            return "电费 AI 工具已被插件配置关闭。"
+        umo = event.unified_msg_origin
+        binding = self.store.get_binding(umo) if self.store else None
+        if warn == 0:
+            gw, gc = self._effective_thresholds(None)
+            w, c = self._effective_thresholds(binding)
+            if binding and binding.get("thresholds"):
+                return (
+                    f"本会话预警线：预警 {w:g} / 紧急 {c:g}（自定义）。"
+                    f"全局默认为 {gw:g} / {gc:g}。"
+                )
+            return f"当前预警线：预警 {gw:g} / 紧急 {gc:g}（全局默认）。"
+        if not event.is_private_chat():
+            return GROUP_WRITE_DENIED
+        if not binding:
+            return "本会话还没有绑定宿舍，无法单独设置预警线；先帮用户完成绑定。"
+        if warn < 0:
+            binding.pop("thresholds", None)
+            self.store.save()
+            gw, gc = self._effective_thresholds(None)
+            self._record_event(umo, "info", "恢复全局预警线")
+            return f"已恢复全局默认预警线：预警 {gw:g} / 紧急 {gc:g}。"
+        try:
+            w = float(warn)
+        except (TypeError, ValueError):
+            return "预警线需要是一个数字（比如 20）。"
+        if w <= 0:
+            return "预警线需要是一个正数（比如 20）。"
+        try:
+            c = float(critical)
+        except (TypeError, ValueError):
+            c = 0.0
+        if c <= 0 or c > w:
+            c = w / 2
+        binding["thresholds"] = {"warn": w, "critical": c}
+        self.store.save()
+        self._record_event(umo, "info", f"自定义预警线 {w:g}/{c:g}")
+        return (
+            f"已设置本会话预警线：余额 ≤ {w:g} 时提醒、≤ {c:g} 时紧急提醒。"
+            "下一个轮询周期（约 20 分钟内）开始按新线判断；说「恢复默认预警线」可还原。"
+        )
 
     def _trend_lines(self, binding: dict, days: int) -> list[str]:
         """按天余额趋势（只读历史，不写）。"""
@@ -1941,6 +2069,7 @@ class DormElectricPlugin(Star):
             "/电费 绑定 1 — 确认绑定\n"
             "/电费 确认 [验证码] — 提交 AI 给的确认码（不带参数则查看待确认项）\n"
             "/电费 静音 [小时] — 暂停余额预警（0 或 取消=恢复；仅私聊）\n"
+            "/电费 预警线 [n] — 本会话自定义预警线（取消=恢复全局；仅私聊）\n"
             "/电费 解绑 — 取消监控（仅私聊）\n"
             "/电费 查询 — 同时查询空调费和宿舍电费\n"
             "/电费 凭证 <JSESSIONID=...> — 更新会话凭证（仅限私聊，热更新）\n"
@@ -2197,6 +2326,56 @@ class DormElectricPlugin(Star):
             )
             return
         yield event.plain_result(self._mute_set(umo, hours))
+
+    @electric.command("预警线")
+    async def cmd_threshold(self, event: AstrMessageEvent, arg: str | None = None):
+        """查看/设置本会话预警线（仅私聊）：无参看当前，取消=恢复全局，数字=设置"""
+        if not event.is_private_chat():
+            yield event.plain_result(GROUP_WRITE_DENIED)
+            return
+        umo = event.unified_msg_origin
+        binding = self.store.get_binding(umo) if self.store else None
+        if arg is None:
+            gw, gc = self._effective_thresholds(None)
+            w, c = self._effective_thresholds(binding)
+            custom = "（自定义）" if binding and binding.get("thresholds") else "（全局默认）"
+            yield event.plain_result(
+                f"当前预警线：预警 {w:g} / 紧急 {c:g}{custom}\n"
+                "用法：/电费 预警线 <预警线>（紧急线自动取一半；取消=恢复全局）"
+            )
+            return
+        s = str(arg).strip()
+        if s in {"取消", "恢复", "解除"}:
+            if not binding:
+                yield event.plain_result("当前会话没有绑定。")
+                return
+            binding.pop("thresholds", None)
+            self.store.save()
+            gw, gc = self._effective_thresholds(None)
+            self._record_event(umo, "info", "恢复全局预警线")
+            yield event.plain_result(f"已恢复全局默认预警线：预警 {gw:g} / 紧急 {gc:g}。")
+            return
+        try:
+            w = float(s)
+        except ValueError:
+            yield event.plain_result(
+                "用法：/电费 预警线 <预警线>（紧急线自动取一半；取消=恢复全局）"
+            )
+            return
+        if w <= 0:
+            yield event.plain_result("预警线需要是一个正数（比如 20）。")
+            return
+        if not binding:
+            yield event.plain_result("本会话还没有绑定宿舍，先 /电费 绑定。")
+            return
+        c = w / 2
+        binding["thresholds"] = {"warn": w, "critical": c}
+        self.store.save()
+        self._record_event(umo, "info", f"自定义预警线 {w:g}/{c:g}")
+        yield event.plain_result(
+            f"已设置本会话预警线：余额 ≤ {w:g} 时提醒、≤ {c:g} 时紧急提醒。\n"
+            "下一个轮询周期开始按新线判断；/电费 预警线 取消 可还原。"
+        )
 
     @electric.command("解绑")
     async def cmd_unbind(self, event: AstrMessageEvent):

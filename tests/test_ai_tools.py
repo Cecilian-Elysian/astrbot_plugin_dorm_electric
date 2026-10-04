@@ -1349,3 +1349,125 @@ def test_check_tool_reports_credential_missing():
     plugin = _plugin(bindings={UMO: _binding()}, hjnu_cookie="")
     text = _call(plugin, plugin.tool_dorm_electric_check(_FakeEvent()))
     assert "凭证：❌ 未配置" in text
+
+# ================= v1.1.6：会话级预警线 + 播报免打扰 =================
+
+
+def test_set_threshold_tool_sets_and_evaluates():
+    """「低于 20 提醒我」：15 度在全局线（10）下不报，按会话线（20）要报。"""
+    plugin = _plugin(bindings={UMO: _binding()})
+    event = _FakeEvent()
+    text = _call(plugin, plugin.tool_dorm_electric_set_alert_threshold(event, 20))
+    assert "≤ 20 时提醒、≤ 10 时紧急提醒" in text
+    binding = plugin.store.get_binding(UMO)
+    _call(plugin, plugin._evaluate_alerts(UMO, binding, 15.0, "ac"))
+    assert plugin._pending_alerts[UMO][0]["warn"] == 20.0
+
+
+def test_set_threshold_status_and_reset():
+    plugin = _plugin(bindings={UMO: _binding()})
+    event = _FakeEvent()
+    status = _call(plugin, plugin.tool_dorm_electric_set_alert_threshold(event, 0))
+    assert "全局默认" in status
+    _call(plugin, plugin.tool_dorm_electric_set_alert_threshold(event, 20))
+    status = _call(plugin, plugin.tool_dorm_electric_set_alert_threshold(event, 0))
+    assert "自定义" in status and "20" in status
+    reset = _call(plugin, plugin.tool_dorm_electric_set_alert_threshold(event, -1))
+    assert "已恢复全局默认" in reset
+    assert "thresholds" not in plugin.store.get_binding(UMO)
+
+
+def test_set_threshold_group_denied_and_unbound():
+    plugin = _plugin(bindings={UMO: _binding()})
+    text = _call(
+        plugin,
+        plugin.tool_dorm_electric_set_alert_threshold(
+            _FakeEvent(GROUP_UMO, private=False), 20
+        ),
+    )
+    assert text == GROUP_WRITE_DENIED
+    bare = _plugin()  # 全新无绑定会话
+    unbound = _call(
+        bare, bare.tool_dorm_electric_set_alert_threshold(_FakeEvent(), 20)
+    )
+    assert "还没有绑定宿舍" in unbound
+
+
+def test_threshold_command_flow():
+    plugin = _plugin(bindings={UMO: _binding()})
+    event = _FakeEvent()
+
+    async def _run():
+        texts = []
+        async for r in plugin.cmd_threshold(event):
+            texts.append(r)
+        async for r in plugin.cmd_threshold(event, "20"):
+            texts.append(r)
+        async for r in plugin.cmd_threshold(event, "取消"):
+            texts.append(r)
+        return texts
+
+    texts = asyncio.run(_run())
+    assert "全局默认" in texts[0]
+    assert "≤ 20 时提醒" in texts[1]
+    assert "已恢复全局默认" in texts[2]
+
+
+def test_mute_tool_daily_scope():
+    plugin = _plugin(bindings={UMO: _binding()})
+    event = _FakeEvent()
+    text = _call(
+        plugin, plugin.tool_dorm_electric_mute_alerts(event, 24, "daily")
+    )
+    assert "已静音每日播报 24 小时" in text
+    assert "预警" not in plugin._alert_muted  # 只关播报，预警照旧
+    status = _call(
+        plugin, plugin.tool_dorm_electric_mute_alerts(event, 0, "daily")
+    )
+    assert "每日播报静音中" in status
+    resume = _call(
+        plugin, plugin.tool_dorm_electric_mute_alerts(event, -1, "daily")
+    )
+    assert "已恢复每日播报" in resume
+
+
+def test_mute_tool_all_scope_and_invalid():
+    plugin = _plugin(bindings={UMO: _binding()})
+    event = _FakeEvent()
+    text = _call(plugin, plugin.tool_dorm_electric_mute_alerts(event, 24, "all"))
+    assert "已静音余额预警 24 小时" in text
+    assert "已静音每日播报 24 小时" in text
+    bad = _call(plugin, plugin.tool_dorm_electric_mute_alerts(event, 24, "周报"))
+    assert "alerts" in bad
+
+
+def test_daily_all_skips_muted_binding():
+    plugin = _plugin(bindings={UMO: _binding(history=True)})
+    sent: list[str] = []
+
+    async def _capture(umo, text):
+        sent.append(umo)
+        return True
+
+    plugin._send = _capture
+    binding = plugin.store.get_binding(UMO)
+    binding["daily_muted_until"] = time.time() + 3600
+
+    async def _run():
+        await plugin._daily_all()
+
+    asyncio.run(_run())
+    assert sent == []
+    binding.pop("daily_muted_until")
+    asyncio.run(_run())
+    assert sent == [UMO]
+
+
+def test_balance_shows_threshold_customization_and_daily_mute():
+    plugin = _plugin(bindings={UMO: _binding()})
+    event = _FakeEvent()
+    _call(plugin, plugin.tool_dorm_electric_set_alert_threshold(event, 20))
+    _call(plugin, plugin.tool_dorm_electric_mute_alerts(event, 24, "daily"))
+    text = _call(plugin, plugin.tool_dorm_electric_balance(event))
+    assert "本会话预警线已自定义为 20 / 10" in text
+    assert "每日播报已静音至" in text
