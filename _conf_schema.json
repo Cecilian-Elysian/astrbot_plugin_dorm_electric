@@ -41,14 +41,35 @@
     "hint": "只有 aid 的顺序有意义：第 1 项是绑定向导的主 aid（空调费），第 2 项是自动关联的宿舍电费 aid。名称仅用于日志展示，代码不读取。发送 /电费 绑定 启动向导，绑定一次宿舍会自动关联两项。"
   },
   "threshold_warn": {
-    "description": "低余额预警线（空调费为度，宿舍电费为元）",
+    "description": "低余额预警线（两费种通用默认）",
     "type": "float",
-    "default": 10
+    "default": 10,
+    "hint": "空调费单位度、宿舍电费单位元。若下面按费种的预警线填了非零值，则该费种优先用按费种的值。"
   },
   "threshold_critical": {
-    "description": "紧急预警线（空调费为度，宿舍电费为元）",
+    "description": "紧急预警线（两费种通用默认）",
     "type": "float",
     "default": 5
+  },
+  "threshold_warn_ac": {
+    "description": "空调费预警线（度，0=用通用默认）",
+    "type": "float",
+    "default": 0
+  },
+  "threshold_critical_ac": {
+    "description": "空调费紧急线（度，0=取空调费预警线一半）",
+    "type": "float",
+    "default": 0
+  },
+  "threshold_warn_elec": {
+    "description": "宿舍电费预警线（元，0=用通用默认）",
+    "type": "float",
+    "default": 0
+  },
+  "threshold_critical_elec": {
+    "description": "宿舍电费紧急线（元，0=取宿舍电费预警线一半）",
+    "type": "float",
+    "default": 0
   },
   "alert_cooldown_hours": {
     "description": "同级预警重复提醒间隔（小时）",
@@ -108,6 +129,12 @@
     "type": "int",
     "default": 300,
     "hint": "AI 发起绑定/解绑时会生成 6 位确认码，必须由用户亲手把这串数字发回来才生效；过期需重新发起。最小按 30 秒生效。"
+  },
+  "ai_prompt_hint": {
+    "description": "聊到电费时在幕后提示 AI 使用本插件工具",
+    "type": "bool",
+    "default": true,
+    "hint": "用户消息或近几轮对话命中「电费/余额/充值」等关键词时，自动在 system_prompt 末尾追加一段幕后指令，让模型优先调用电费工具、不编造余额。平时对话零额外 token 开销。"
   },
   "ai_lookup_cache_seconds": {
     "description": "按房间名反查余额的结果缓存（秒）",

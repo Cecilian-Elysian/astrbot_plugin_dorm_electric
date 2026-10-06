@@ -1,0 +1,106 @@
+/* 宿舍电费监控仪表盘 · 亮暗主题跟随 AstrBot WebUI */
+:root {
+  --bg: #f5f7fa;
+  --card-bg: #ffffff;
+  --border: #e2e8f0;
+  --text: #1e293b;
+  --text-secondary: #64748b;
+  --text-muted: #94a3b8;
+  --accent: #2563eb;
+  --ok: #16a34a;
+  --warn: #d97706;
+  --critical: #dc2626;
+}
+[data-theme="dark"] {
+  --bg: #0f172a;
+  --card-bg: #1e293b;
+  --border: #334155;
+  --text: #e2e8f0;
+  --text-secondary: #94a3b8;
+  --text-muted: #64748b;
+  --accent: #60a5fa;
+  --ok: #4ade80;
+  --warn: #fbbf24;
+  --critical: #f87171;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+}
+#app { max-width: 1080px; margin: 0 auto; padding: 16px 20px 32px; }
+
+#topbar {
+  display: flex; align-items: baseline; justify-content: space-between;
+  padding: 4px 2px 14px;
+}
+.brand { font-size: 1.15rem; font-weight: 700; }
+.meta { color: var(--text-secondary); font-size: 0.85rem; }
+
+.summary-cards {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px; margin-bottom: 16px;
+}
+.card-mini {
+  background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px;
+  padding: 14px 16px; display: flex; align-items: center; gap: 12px;
+}
+.card-mini .card-icon { font-size: 1.4rem; }
+.card-mini .card-value { font-size: 1.25rem; font-weight: 700; line-height: 1.1; }
+.card-mini .card-label { color: var(--text-secondary); font-size: 0.8rem; margin-top: 2px; }
+.card-mini.card-success .card-value { color: var(--ok); }
+.card-mini.card-alert .card-value { color: var(--critical); }
+.card-mini.card-warn .card-value { color: var(--warn); }
+
+.card {
+  background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px;
+  padding: 16px 18px; margin-bottom: 16px;
+}
+.chart-header {
+  display: flex; align-items: center; justify-content: space-between;
+  flex-wrap: wrap; gap: 10px; margin-bottom: 12px;
+}
+.chart-header h2, .table-header h2 { font-size: 1rem; margin: 0; }
+.chart-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.chart-wrap { position: relative; height: 320px; }
+#chart-empty { text-align: center; padding: 48px 0; color: var(--text-muted); }
+.empty-icon { font-size: 2rem; display: block; margin-bottom: 8px; }
+.hidden { display: none !important; }
+
+select {
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 6px 10px; font-size: 0.85rem; max-width: 340px;
+}
+.group-toggle { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.group-btn {
+  background: transparent; color: var(--text-secondary); border: none;
+  padding: 6px 12px; font-size: 0.8rem; cursor: pointer;
+}
+.group-btn.active { background: var(--accent); color: #fff; }
+
+.table-wrap { overflow-x: auto; }
+.table-header { padding: 14px 18px 0; }
+table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { color: var(--text-secondary); font-weight: 500; white-space: nowrap; }
+tr:last-child td { border-bottom: none; }
+.mono { font-family: ui-monospace, Consolas, monospace; font-size: 0.78rem; color: var(--text-secondary); }
+.muted { color: var(--text-muted); }
+.meta-line { color: var(--text-muted); font-size: 0.75rem; margin-top: 2px; }
+.meta-cell { color: var(--text-secondary); font-size: 0.78rem; white-space: nowrap; }
+.val-ok { color: var(--ok); font-weight: 600; }
+.val-warn { color: var(--warn); font-weight: 600; }
+.val-critical { color: var(--critical); font-weight: 700; }
+.tag {
+  display: inline-block; margin-left: 4px; padding: 1px 6px; border-radius: 6px;
+  font-size: 0.7rem; background: var(--bg); color: var(--text-secondary);
+  border: 1px solid var(--border);
+}
+#error {
+  background: var(--card-bg); border: 1px solid var(--critical); color: var(--critical);
+  border-radius: 10px; padding: 10px 14px; margin-bottom: 14px; font-size: 0.85rem;
+}

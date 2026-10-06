@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>宿舍电费监控</title>
+<link rel="stylesheet" href="./style.css"/>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.8/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<div id="app">
+<header id="topbar">
+<div class="brand">⚡ 宿舍电费监控</div>
+<div class="meta" id="global-meta">加载中…</div>
+</header>
+<main id="main">
+<div id="error" class="hidden"></div>
+
+<section id="cards" class="summary-cards"></section>
+
+<section class="card">
+<div class="chart-header">
+<h2>📈 每日余额趋势</h2>
+<div class="chart-controls">
+<select id="session-selector"></select>
+<div class="group-toggle">
+<button class="group-btn active" data-days="14">14 天</button>
+<button class="group-btn" data-days="30">30 天</button>
+<button class="group-btn" data-days="60">60 天</button>
+</div>
+</div>
+</div>
+<div class="chart-wrap"><canvas id="chart"></canvas></div>
+<div id="chart-empty" class="hidden">
+<span class="empty-icon">📉</span>
+<p>暂无历史数据，等轮询跑几轮后再来</p>
+</div>
+</section>
+
+<section class="card" style="padding:0;overflow:hidden">
+<div class="table-header"><h2>📋 绑定会话</h2></div>
+<div class="table-wrap">
+<table>
+<thead><tr><th>会话</th><th>房间</th><th>空调费</th><th>宿舍电费</th><th>预警线</th><th>提醒状态</th></tr></thead>
+<tbody id="binding-tbody"></tbody>
+</table>
+</div>
+</section>
+</main>
+</div>
+<script type="module" src="./app.js"></script>
+</body>
+</html>

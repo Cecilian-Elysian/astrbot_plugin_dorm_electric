@@ -79,6 +79,7 @@ def _install_stubs() -> None:
         # 测试只需透传装饰器本身，桩不做 docstring 解析。
         event_message_type = staticmethod(_passthrough)
         llm_tool = staticmethod(_passthrough)
+        on_llm_request = staticmethod(_passthrough)
 
     api_event.AstrMessageEvent = AstrMessageEvent
     api_event.MessageChain = MessageChain

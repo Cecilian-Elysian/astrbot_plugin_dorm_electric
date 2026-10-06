@@ -660,7 +660,9 @@ def test_balance_reports_thresholds_and_daily_report():
     assert f"⚡ {LABEL}/A-8-17" in text
     assert "空调费：94.66 度" in text
     assert "宿舍电费：12.30 元" in text
-    assert "预警线 10 / 紧急线 5" in text
+    # v1.1.7 起预警线按费种展示（空调费度、宿舍电费元）
+    assert "空调费：预警 10 度 / 紧急 5 度" in text
+    assert "宿舍电费：预警 10 元 / 紧急 5 元" in text
     assert "每日播报 08:00" in text
     assert "轮询间隔 20 分钟" in text
     assert "空调费：✅ 高于预警线，状态正常。" in text
@@ -1469,5 +1471,7 @@ def test_balance_shows_threshold_customization_and_daily_mute():
     _call(plugin, plugin.tool_dorm_electric_set_alert_threshold(event, 20))
     _call(plugin, plugin.tool_dorm_electric_mute_alerts(event, 24, "daily"))
     text = _call(plugin, plugin.tool_dorm_electric_balance(event))
-    assert "本会话预警线已自定义为 20 / 10" in text
+    # v1.1.7 起会话自定义预警线按费种展示；all 语义 = 两费种同值
+    assert "本会话预警线已自定义：空调费：预警 20 度 / 紧急 10 度" in text
+    assert "宿舍电费：预警 20 元 / 紧急 10 元" in text
     assert "每日播报已静音至" in text

@@ -1,10 +1,11 @@
 ﻿"""宿舍电费余额监控预警插件。
 
 - /电费 指令组：绑定宿舍向导、查询、状态、凭证、历史、日志、自检、确认验证码
-- 定时轮询余额 → 低余额/紧急预警（含冷却），预警按会话合并为单条消息
-- 轮询同时保活学校缴费系统会话凭证
-- 每日定时播报：当前余额（两种费种）
-- 7 个 LLM 工具：把学校/宿舍结构、余额、配置交给 AI 对话；写操作需用户回复验证码
+- 定时轮询余额 → 低余额/紧急预警（含冷却，分费种独立预警线），预警按会话合并
+- 轮询同时保活学校缴费系统会话凭证；每日定时播报（含 24h 充值检测）
+- 10 个 LLM 工具：绑定/查询/预警线等全部可对话操作；写操作需用户回复验证码
+- on_llm_request 钩子：聊到电费相关话题时在幕后提示模型使用本插件工具
+- WebUI 仪表盘：插件详情页内嵌余额卡片与折线图（只读）
 - 数据源：hjnu（学校缴费系统自动查询）
 """
 
@@ -68,6 +69,38 @@ CODE_ONLY_PATTERN = r"[\s，,。.!！?？:：]*{code}[\s，,。.!！?？:：]*"
 # 码是 6 位随机数且按会话隔离，私聊里没有误判对象；群聊仍只用上面的严格格式。
 CODE_KEYWORD_PATTERN = r"(?:确认|验证码|码)\s*[是码:：,，\s]*{code}(?!\d)"
 
+# —— AI 触达（幕后指令注入）——
+# 用户消息或近几轮上下文命中这些词时，才把 AI_ELECTRIC_HINT 追加进 system_prompt。
+# 宁宽勿漏：误命中（如聊手机充电）最多多花一轮 token，模型不会乱调工具；
+# 漏命中则 AI 可能想不起来用插件。按真实用户说法随时可增删。
+AI_HINT_KEYWORDS: tuple[str, ...] = (
+    "电费", "空调费", "水电", "电量", "用电", "多少度", "几度电", "度电",
+    "余额", "缴费", "充值", "欠费", "还能用", "撑几天", "够用",
+    "宿舍电", "绑定宿舍", "解绑", "静音", "播报", "低于", "提醒", "春雪楼",
+)
+
+# 追加给模型的幕后指令（固定文本，利于前缀缓存；严禁回显任何凭证值）。
+AI_ELECTRIC_HINT = (
+    "【宿舍电费插件】机器人接有宿舍电费监控插件。用户话题涉及电费、空调费、"
+    "余额、用电量、充值缴费，或想绑定/改绑/解绑宿舍监控、调整提醒与播报时："
+    "必须调用 dorm_electric_* 系列工具获取真实数据，严禁编造或估算余额数字。"
+    "查任意宿舍的余额用 dorm_electric_query_room（直接传用户原话）；"
+    "查本会话绑定宿舍的余额与趋势用 dorm_electric_balance；"
+    "绑定/改绑用 dorm_electric_bind_room（传房间原话，用户回复验证码后再调 "
+    "dorm_electric_confirm）。/电费 指令只是兜底，不要主动让用户记指令。"
+)
+
+
+def _llm_request_hook():
+    """取 on_llm_request 装饰器；宿主版本过旧没有该钩子时退化为 no-op。
+
+    插件必须在缺钩子的宿主上照常加载，所以这里不抛 AttributeError。
+    """
+    deco = getattr(filter, "on_llm_request", None)
+    if deco is None:
+        return lambda func: func
+    return deco()
+
 CREDENTIAL_HINT = (
     "🔐 学校系统凭证已失效或尚未配置。\n"
     "重新获取 JSESSIONID 后私聊发送：/电费 凭证 JSESSIONID=xxxx\n"
@@ -91,9 +124,8 @@ def electric():
 @register(
     PLUGIN_NAME,
     "Cecilian",
-    "宿舍电费余额监控预警：低余额预警、每日播报、双费种同时查询、支持 AI 对话绑定",
-    "1.1.6",
-
+    "宿舍电费余额监控预警：低余额预警、每日播报、双费种同时查询、支持 AI 对话绑定与 WebUI 仪表盘",
+    "1.1.7",
 )
 class DormElectricPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -149,6 +181,7 @@ class DormElectricPlugin(Star):
             )
         self.scheduler.start()
         logger.info(f"[{PLUGIN_NAME}] 插件已初始化，轮询={poll_min}min")
+        self._register_dashboard()
 
         self._tasks.append(asyncio.create_task(self._startup_poll()))
 
@@ -465,25 +498,66 @@ class DormElectricPlugin(Star):
             )
         await self._flush_alerts()
 
-    def _effective_thresholds(self, binding: dict | None) -> tuple[float, float]:
-        """生效预警线：本会话自定义（binding.thresholds）优先，否则用全局配置。"""
-        warn = self._cfg_float("threshold_warn", 10)
-        critical = self._cfg_float("threshold_critical", 5)
+    def _effective_thresholds(
+        self, binding: dict | None, kind: str = "ac"
+    ) -> tuple[float, float]:
+        """生效预警线（按费种）。
+
+        优先级：会话 per-fee 自定义 > 全局 per-fee 配置（threshold_warn_ac 等）
+        > 全局旧配置（threshold_warn/critical，两费种共用，老用户零感知）。
+        会话存储兼容两代格式：新 {"ac": {warn, critical}, "elec": {…}} 只存
+        自定义过的费种；旧 {"warn":…, "critical":…} 视为两费种共用。
+        """
+        warn = (
+            self._cfg_float(f"threshold_warn_{kind}", 0)
+            or self._cfg_float("threshold_warn", 10)
+        )
+        critical = (
+            self._cfg_float(f"threshold_critical_{kind}", 0)
+            or self._cfg_float("threshold_critical", 5)
+        )
         if critical > warn:
             warn, critical = critical, warn
         t = (binding or {}).get("thresholds") or {}
+        if not isinstance(t, dict):
+            t = {}
+        ft = t.get(kind)
+        if not isinstance(ft, dict):
+            # legacy：整份 flat dict 就是两费种共用的自定义值
+            ft = t if ("warn" in t or "critical" in t) else {}
         try:
-            w = float(t.get("warn") or 0)
+            w = float(ft.get("warn") or 0)
         except (TypeError, ValueError):
             w = 0.0
         try:
-            c = float(t.get("critical") or 0)
+            c = float(ft.get("critical") or 0)
         except (TypeError, ValueError):
             c = 0.0
         if w > 0:
             warn = w
             critical = c if 0 < c <= warn else w / 2
         return warn, critical
+
+    def _threshold_lines(self, binding: dict | None) -> list[str]:
+        """两费种生效预警线展示行（balance / 预警线状态 / 配置摘要共用）。"""
+        lines = []
+        for kind in ("ac", "elec"):
+            unit = "度" if kind == "ac" else "元"
+            w, c = self._effective_thresholds(binding, kind)
+            lines.append(
+                f"{self._fee_name(kind)}：预警 {w:g} {unit} / 紧急 {c:g} {unit}"
+            )
+        return lines
+
+    @staticmethod
+    def _set_session_threshold(
+        binding: dict, kind: str, warn: float, critical: float
+    ) -> None:
+        """写一条会话 per-fee 自定义预警线（新格式，只动指定费种）。"""
+        binding.setdefault("thresholds", {})[kind] = {
+            "warn": warn,
+            "critical": critical,
+        }
 
     def _daily_muted_until(self, binding: dict | None) -> float:
         try:
@@ -497,7 +571,7 @@ class DormElectricPlugin(Star):
         """评估预警：仅更新 state 与 pending_alerts，由 _flush_alerts 统一发送。"""
         if float(self._alert_muted.get(umo, 0) or 0) > time.time():
             return
-        warn, critical = self._effective_thresholds(binding)
+        warn, critical = self._effective_thresholds(binding, kind)
         cooldown = self._cfg_float("alert_cooldown_hours", 24) * 3600
         if value <= critical:
             level = 2
@@ -636,7 +710,12 @@ class DormElectricPlugin(Star):
             if not history:
                 continue
             value = float(history[-1]["v"])
-            lines.append(f"{self._fee_name(kind)}：{value:.2f} {history[-1].get('u', '度')}")
+            unit = history[-1].get("u", "度")
+            line = f"{self._fee_name(kind)}：{value:.2f} {unit}"
+            stats = self._history_stats(history)
+            if stats and stats.get("recharged_24h", 0) > 0:
+                line += f"（24h 检测到充值 +{stats['recharged_24h']:.2f} {unit}）"
+            lines.append(line)
         return "\n".join(lines) if len(lines) > 1 else None
 
     @staticmethod
@@ -1172,6 +1251,61 @@ class DormElectricPlugin(Star):
             f"用户已回复{self._ACTION_LABEL.get(token['action'], token['action'])}确认码",
         )
 
+    # ================= AI 触达：幕后指令注入 =================
+    # 弱模型（flash 级）选不选工具全靠自觉；聊到电费时在 system_prompt 末尾
+    # 明确指示「必须调 dorm_electric_* 工具、严禁编数字」，是让 AI「反应过来」
+    # 最有效的一招。只在关键词命中时注入：平时零 token 开销，提示文本固定
+    # 也有利于服务商侧的前缀缓存。
+
+    @staticmethod
+    def _collect_hint_texts(event: AstrMessageEvent, req) -> list[str]:
+        """关键词扫描的文本源：本轮消息 + 本轮 prompt + 近几轮历史。"""
+        texts: list[str] = []
+        msg = str(getattr(event, "message_str", "") or "")
+        if msg:
+            texts.append(msg)
+        prompt = getattr(req, "prompt", None)
+        if isinstance(prompt, str) and prompt:
+            texts.append(prompt)
+        contexts = getattr(req, "contexts", None)
+        if isinstance(contexts, list):
+            for item in contexts[-6:]:
+                if not isinstance(item, dict):
+                    continue
+                content = item.get("content")
+                if isinstance(content, str) and content:
+                    texts.append(content)
+                elif isinstance(content, list):
+                    # 多模态 content：[{"type": "text", "text": …}, …]
+                    for part in content:
+                        if isinstance(part, dict) and isinstance(part.get("text"), str):
+                            texts.append(part["text"])
+        return texts
+
+    def _hit_electric_topic(self, event: AstrMessageEvent, req) -> bool:
+        return any(
+            kw in text
+            for text in self._collect_hint_texts(event, req)
+            for kw in AI_HINT_KEYWORDS
+        )
+
+    @_llm_request_hook()
+    async def inject_electric_hint(self, event: AstrMessageEvent, req) -> None:
+        """关键词命中的对话，在 system_prompt 末尾追加电费工具提示（幂等）。"""
+        try:
+            if not self._ai_enabled() or not self._cfg_bool("ai_prompt_hint", True):
+                return
+            if not self._hit_electric_topic(event, req):
+                return
+            prompt = getattr(req, "system_prompt", None)
+            if not isinstance(prompt, str):
+                prompt = ""
+            if AI_ELECTRIC_HINT in prompt:
+                return
+            req.system_prompt = (prompt.rstrip() + "\n" + AI_ELECTRIC_HINT).strip()
+        except Exception as e:  # 注入失败绝不能影响正常对话
+            logger.warning(f"[{PLUGIN_NAME}] 电费提示注入失败：{e!r}")
+
     # ================= AI 对话：绑定向导工具 =================
     # 工具返回值语义（AstrBot v4.27 astr_agent_tool_exec._execute_local）：
     #   return str            → 文本作为工具结果喂给 LLM
@@ -1274,7 +1408,8 @@ class DormElectricPlugin(Star):
     ) -> str:
         """选定房间并向用户发一个绑定确认码（此时还没真正绑定）。
 
-        用户说过房间信息（例如「春雪楼2 8层 A817」「春雪楼817」）时，把原话传给
+        用户想绑定、换宿舍或改绑监控房间时调用本工具。用户说过房间信息
+        （例如「春雪楼2 8层 A817」「春雪楼817」）时，把原话传给
         hint 直接发起，完全不需要 browse/pick；几轮之前说过的也算——对话里能找到
         房间就传，不要重新问。用户只说了「绑定」这类碎片时，工具会提示本会话
         最近定位过的房间，照它给的 hint 重调即可。楼栋名以工具返回为准，不要臆造。
@@ -1442,12 +1577,10 @@ class DormElectricPlugin(Star):
     # ================= AI 对话：查询工具 =================
 
     def _config_brief(self) -> str:
-        """给 AI 的一句话配置摘要：预警线、播报时间、轮询间隔。"""
+        """给 AI 的一句话配置摘要：分费种预警线、播报时间、轮询间隔。"""
         poll = self._cfg("poll_interval_minutes", 20)
         return (
-            f"预警线 {self._cfg_float('threshold_warn', 10):g} / "
-            f"紧急线 {self._cfg_float('threshold_critical', 5):g}"
-            f"（空调费单位度，宿舍电费单位元）；"
+            f"预警线 {'；'.join(self._threshold_lines(None))}；"
             f"每日播报 {self._cfg('daily_time', '08:00')}"
             f"（{self._cfg('daily_timezone', 'Asia/Shanghai')}）；"
             f"轮询间隔 {poll} 分钟"
@@ -1468,6 +1601,9 @@ class DormElectricPlugin(Star):
     ) -> str:
         """查本会话绑定宿舍的当前电费余额（空调费 + 宿舍电费），顺带告知预警线与播报设置。
 
+        只要用户问起本会话宿舍的电费/空调费，例如「电费还剩多少」「空调费还有多少」
+        「这个月用了多少」「还能用几天」「余额够不够」，都调用本工具；不要凭印象回答。
+
         Args:
             days(int): 顺便看最近几天的每日余额，0 表示只看当前余额，最大 60
         """
@@ -1483,11 +1619,11 @@ class DormElectricPlugin(Star):
             )
         results = await self._fetch_fees(binding)
         self._remember_raw(umo, results)
-        warn, critical = self._effective_thresholds(binding)
         lines = [f"⚡ {self._binding_label(binding)}"]
         lines.extend(self._format_fee_results(results, include_missing=True))
         for kind in ("ac", "elec"):
             result = results.get(kind)
+            warn, critical = self._effective_thresholds(binding, kind)
             if result is not None and result.ok and result.value is not None:
                 lines.append(
                     f"  {self._fee_name(kind)}："
@@ -1507,7 +1643,7 @@ class DormElectricPlugin(Star):
         lines.append(self._config_brief())
         if binding.get("thresholds"):
             lines.append(
-                f"（本会话预警线已自定义为 {warn:g} / {critical:g}，"
+                f"（本会话预警线已自定义：{'；'.join(self._threshold_lines(binding))}；"
                 "说「恢复默认预警线」可还原）"
             )
         daily_until = self._daily_muted_until(binding)
@@ -1621,30 +1757,44 @@ class DormElectricPlugin(Star):
 
     @filter.llm_tool(name="dorm_electric_set_alert_threshold")
     async def tool_dorm_electric_set_alert_threshold(
-        self, event: AstrMessageEvent, warn: float = 0, critical: float = 0
+        self,
+        event: AstrMessageEvent,
+        warn: float = 0,
+        critical: float = 0,
+        kind: str = "all",
     ) -> str:
         """设置本会话的余额预警线（只影响这个会话的提醒，不改全局配置、不影响其他会话）。
 
-        用户说「低于 20 就提醒我」「余额少于 5 立刻告诉我」这类话时调用。
+        用户说「低于 20 就提醒我」「空调费低于 5 立刻告诉我」这类话时调用。
+        空调费按度计、宿舍电费按元计，消耗速度不同，可以只给其中一个设置（kind 传 ac 或 elec）。
         写操作仅限私聊。预警线只对该会话已绑定的房间生效，未绑定无法设置。
 
         Args:
             warn(number): 预警线：余额低于它时发预警提醒；0 = 只看当前生效值；-1 = 恢复全局默认
             critical(number): 紧急线（低于它时发紧急提醒），可不传，默认取预警线的一半
+            kind(string): 作用费种："ac"=只设空调费；"elec"=只设宿舍电费；"all"=两者都设（默认）；「空调」「电」这类中文也可以
         """
         if not self._ai_enabled():
             return "电费 AI 工具已被插件配置关闭。"
         umo = event.unified_msg_origin
+        kind_map = {
+            "ac": "ac", "all": "all",
+            "空调": "ac", "空调费": "ac",
+            "elec": "elec", "电": "elec", "电费": "elec", "宿舍电费": "elec",
+            "宿舍电": "elec", "宿舍": "elec",
+        }
+        k = kind_map.get(str(kind or "all").strip().lower(), "")
+        if not k:
+            return "kind 只支持 ac（空调费）/ elec（宿舍电费）/ all（两者）。"
         binding = self.store.get_binding(umo) if self.store else None
         if warn == 0:
-            gw, gc = self._effective_thresholds(None)
-            w, c = self._effective_thresholds(binding)
             if binding and binding.get("thresholds"):
+                custom = "；".join(self._threshold_lines(binding))
                 return (
-                    f"本会话预警线：预警 {w:g} / 紧急 {c:g}（自定义）。"
-                    f"全局默认为 {gw:g} / {gc:g}。"
+                    f"本会话预警线（自定义）：{custom}。"
+                    f"全局默认：{'；'.join(self._threshold_lines(None))}。"
                 )
-            return f"当前预警线：预警 {gw:g} / 紧急 {gc:g}（全局默认）。"
+            return f"当前预警线（全局默认）：{'；'.join(self._threshold_lines(None))}。"
         if not event.is_private_chat():
             return GROUP_WRITE_DENIED
         if not binding:
@@ -1654,7 +1804,10 @@ class DormElectricPlugin(Star):
             self.store.save()
             gw, gc = self._effective_thresholds(None)
             self._record_event(umo, "info", "恢复全局预警线")
-            return f"已恢复全局默认预警线：预警 {gw:g} / 紧急 {gc:g}。"
+            return (
+                f"已恢复全局默认预警线：预警 {gw:g} / 紧急 {gc:g}"
+                "（两费种回到全局配置）。"
+            )
         try:
             w = float(warn)
         except (TypeError, ValueError):
@@ -1667,12 +1820,22 @@ class DormElectricPlugin(Star):
             c = 0.0
         if c <= 0 or c > w:
             c = w / 2
-        binding["thresholds"] = {"warn": w, "critical": c}
+        kinds = ("ac", "elec") if k == "all" else (k,)
+        for one in kinds:
+            self._set_session_threshold(binding, one, w, c)
         self.store.save()
-        self._record_event(umo, "info", f"自定义预警线 {w:g}/{c:g}")
+        scope = "空调费和宿舍电费" if k == "all" else self._fee_name(k)
+        unit = "，单位分别为度、元" if k == "all" else (
+            "，单位度" if k == "ac" else "，单位元"
+        )
+        self._record_event(
+            umo, "info",
+            f"自定义预警线 {scope} {w:g}/{c:g}",
+        )
         return (
-            f"已设置本会话预警线：余额 ≤ {w:g} 时提醒、≤ {c:g} 时紧急提醒。"
-            "下一个轮询周期（约 20 分钟内）开始按新线判断；说「恢复默认预警线」可还原。"
+            f"已设置本会话预警线（{scope}{unit}）：余额 ≤ {w:g} 时提醒、"
+            f"≤ {c:g} 时紧急提醒。下一个轮询周期（约 20 分钟内）开始按新线判断；"
+            "说「恢复默认预警线」可还原。"
         )
 
     def _trend_lines(self, binding: dict, days: int) -> list[str]:
@@ -2024,8 +2187,10 @@ class DormElectricPlugin(Star):
     ) -> str:
         """按房间名/编号查任意宿舍的当前电费余额，不需要绑定。
 
-        用户只说了模糊片段（如「春雪」）时，工具会提示本会话最近定位过的房间，
-        照它给的 hint 重调即可；楼栋名以工具返回为准，不要臆造。
+        用户想查「某间宿舍」的电费时（无论本会话是否已绑定），把他说的话直接传进来，
+        例如「春雪楼817 电费多少」「帮我看看 5-302」。用户只说了模糊片段（如「春雪」）时，
+        工具会提示本会话最近定位过的房间，照它给的 hint 重调即可；楼栋名以工具返回为准，
+        不要臆造。
 
         Args:
             room_hint(string): 用户的原话直接传，例如 春雪楼817、817、A-8-17、A817、春雪楼2 8层 A817
@@ -2050,6 +2215,116 @@ class DormElectricPlugin(Star):
             self._lookup_cache[cache_key] = (time.time(), text)
         return text
 
+
+    # ================= WebUI 仪表盘（只读） =================
+    # AstrBot 插件页面机制：context.register_web_api 注册带 WebUI 登录鉴权的
+    # REST 端点；pages/dashboard/ 下的前端经 window.AstrBotPluginPage Bridge
+    # 调用（apiGet("dashboard/overview") → /插件名/dashboard/overview）。
+    # 首版只读：解绑/改配置仍走聊天，验证码同意链不在网页上复制。
+    # 任何响应都不得包含 cookie 值（有测试断言）。
+
+    def _register_dashboard(self):
+        reg = getattr(self.context, "register_web_api", None)
+        if not callable(reg):
+            logger.info(f"[{PLUGIN_NAME}] 宿主不支持 register_web_api，仪表盘端点未注册")
+            return
+        base = f"/{PLUGIN_NAME}/dashboard"
+        try:
+            reg(f"{base}/overview", self._web_overview, ["GET"], "电费仪表盘概览")
+            reg(f"{base}/history", self._web_history, ["GET"], "电费仪表盘历史")
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_NAME}] 仪表盘端点注册失败：{e!r}")
+
+    def _web_binding_item(self, umo: str, binding: dict) -> dict:
+        """单个绑定的仪表盘数据（纯数据，无任何凭证字段）。"""
+        fees = {}
+        for kind in ("ac", "elec"):
+            history = (binding.get("history_by_fee") or {}).get(kind) or []
+            latest = history[-1] if history else None
+            try:
+                latest_value = float(latest["v"]) if latest else None
+            except (TypeError, ValueError, KeyError):
+                latest_value = None
+            stats = self._history_stats(history)
+            warn, critical = self._effective_thresholds(binding, kind)
+            fees[kind] = {
+                "name": self._fee_name(kind),
+                "unit": (latest or {}).get("u", "度" if kind == "ac" else "元"),
+                "latest_value": latest_value,
+                "latest_time": float(latest["t"]) if latest else None,
+                "warn": warn,
+                "critical": critical,
+                "custom": bool(
+                    isinstance(binding.get("thresholds"), dict)
+                    and isinstance(binding["thresholds"].get(kind), dict)
+                ),
+                "per_day": stats["per_day"] if stats else 0.0,
+                "recharged_24h": stats["recharged_24h"] if stats else 0.0,
+                "points": len(history),
+            }
+        return {
+            "umo": umo,
+            "label": self._binding_label(binding),
+            "fees": fees,
+            "alert_muted_until": float(self._alert_muted.get(umo, 0) or 0),
+            "daily_muted_until": self._daily_muted_until(binding),
+        }
+
+    async def _web_overview(self):
+        """仪表盘概览：全部绑定 + 全局状态。"""
+        try:
+            bindings = (self.store.data.get("bindings", {}) if self.store else {}) or {}
+            cookie = str(self.config.get("hjnu_cookie", "") or "")
+            return {
+                "success": True,
+                "data": {
+                    "bindings": [
+                        self._web_binding_item(umo, b) for umo, b in bindings.items()
+                    ],
+                    "cookie_ok": bool(cookie.strip()),
+                    "poll_interval_minutes": self._cfg_int("poll_interval_minutes", 20),
+                    "daily_time": str(self._cfg("daily_time", "08:00")),
+                    "daily_report": self._cfg_bool("daily_report", True),
+                    "server_time": time.time(),
+                },
+            }
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    async def _web_history(self):
+        """仪表盘历史：指定会话两个费种的日末快照序列（days 上限 60）。"""
+        try:
+            try:
+                from quart import request
+            except ImportError:
+                return {"success": False, "message": "宿主 Web 框架不可用"}
+            umo = str(request.args.get("umo", ""))
+            days = max(1, min(60, int(request.args.get("days", 14))))
+            binding = self.store.get_binding(umo) if self.store else None
+            if not binding:
+                return {"success": False, "message": "会话不存在或未绑定"}
+            tz = self._resolve_tz(self._cfg("daily_timezone", "Asia/Shanghai"))
+            series = {}
+            for kind in ("ac", "elec"):
+                history = (binding.get("history_by_fee") or {}).get(kind) or []
+                snaps = self._daily_snapshots(history, tz, days)
+                series[kind] = [
+                    {
+                        "date": str(d),
+                        "value": (float(rec["v"]) if rec else None),
+                    }
+                    for d, rec in snaps
+                ]
+            return {
+                "success": True,
+                "data": {
+                    "label": self._binding_label(binding),
+                    "days": days,
+                    "series": series,
+                },
+            }
+        except Exception as e:
+            return {"success": False, "message": str(e)}
 
     # ================= 指令：帮助与状态 =================
 
@@ -2206,7 +2481,8 @@ class DormElectricPlugin(Star):
     async def tool_dorm_electric_check(self, event: AstrMessageEvent) -> str:
         """一次性自检：凭证状态 + 绑定摘要 + 两个费种实时查询 + 本会话最近事件。只读，群里也能用。
 
-        用户说「凭证还有效吗」「怎么没提醒我」「检查一下电费查询」这类话时调用。
+        用户说「凭证还有效吗」「怎么没提醒我」「电费是不是查不了/挂了」「检查一下电费查询」
+        这类话时调用。
         凭证（JSESSIONID）永远不要向用户索要、不要转述或保存：用户自己贴出来时，
         让他私下发送 /电费 凭证 JSESSIONID=… 更新。
         """
@@ -2335,13 +2611,18 @@ class DormElectricPlugin(Star):
             return
         umo = event.unified_msg_origin
         binding = self.store.get_binding(umo) if self.store else None
+        usage = (
+            "用法：/电费 预警线 <预警线>（空调费和宿舍电费同时设，紧急线自动取一半）\n"
+            "只设一种：/电费 预警线 空调 <预警线> 或 /电费 预警线 电 <预警线>"
+            "（空调费单位度、宿舍电费单位元；取消=恢复全局）"
+        )
         if arg is None:
-            gw, gc = self._effective_thresholds(None)
-            w, c = self._effective_thresholds(binding)
             custom = "（自定义）" if binding and binding.get("thresholds") else "（全局默认）"
             yield event.plain_result(
-                f"当前预警线：预警 {w:g} / 紧急 {c:g}{custom}\n"
-                "用法：/电费 预警线 <预警线>（紧急线自动取一半；取消=恢复全局）"
+                f"当前预警线{custom}：\n  "
+                + "\n  ".join(self._threshold_lines(binding))
+                + "\n全局默认：\n  " + "\n  ".join(self._threshold_lines(None))
+                + f"\n{usage}"
             )
             return
         s = str(arg).strip()
@@ -2355,12 +2636,17 @@ class DormElectricPlugin(Star):
             self._record_event(umo, "info", "恢复全局预警线")
             yield event.plain_result(f"已恢复全局默认预警线：预警 {gw:g} / 紧急 {gc:g}。")
             return
+        # 单费种前缀：「空调 20」「电 20」「ac 20」「elec 20」
+        kind = "all"
+        parts = s.split()
+        kind_map = {"空调": "ac", "空调费": "ac", "ac": "ac",
+                    "电": "elec", "电费": "elec", "宿舍电费": "elec", "elec": "elec"}
+        if len(parts) == 2 and kind_map.get(parts[0].lower()):
+            kind, s = kind_map[parts[0].lower()], parts[1]
         try:
             w = float(s)
         except ValueError:
-            yield event.plain_result(
-                "用法：/电费 预警线 <预警线>（紧急线自动取一半；取消=恢复全局）"
-            )
+            yield event.plain_result(usage)
             return
         if w <= 0:
             yield event.plain_result("预警线需要是一个正数（比如 20）。")
@@ -2369,11 +2655,14 @@ class DormElectricPlugin(Star):
             yield event.plain_result("本会话还没有绑定宿舍，先 /电费 绑定。")
             return
         c = w / 2
-        binding["thresholds"] = {"warn": w, "critical": c}
+        kinds = ("ac", "elec") if kind == "all" else (kind,)
+        for one in kinds:
+            self._set_session_threshold(binding, one, w, c)
         self.store.save()
-        self._record_event(umo, "info", f"自定义预警线 {w:g}/{c:g}")
+        scope = "空调费和宿舍电费" if kind == "all" else self._fee_name(kind)
+        self._record_event(umo, "info", f"自定义预警线 {scope} {w:g}/{c:g}")
         yield event.plain_result(
-            f"已设置本会话预警线：余额 ≤ {w:g} 时提醒、≤ {c:g} 时紧急提醒。\n"
+            f"已设置本会话预警线（{scope}）：余额 ≤ {w:g} 时提醒、≤ {c:g} 时紧急提醒。\n"
             "下一个轮询周期开始按新线判断；/电费 预警线 取消 可还原。"
         )
 
