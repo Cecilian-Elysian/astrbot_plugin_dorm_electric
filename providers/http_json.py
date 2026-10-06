@@ -193,10 +193,8 @@ class HjnuProvider(ElecProvider):
         parsed = parse_balance(raw_msg)
         if parsed is None:
             return BalanceResult(ok=False, value=None, raw=raw_msg or "接口未返回余额文本")
-        value, room, unit = parsed
-        return BalanceResult(
-            ok=True, value=value, raw=raw_msg, unit=unit, extra={"room": room}
-        )
+        value, _room, unit = parsed
+        return BalanceResult(ok=True, value=value, raw=raw_msg, unit=unit)
 
     async def list_areas(self, aid: str) -> list[dict]:
         data = await self._post("/wechat/basicQuery/queryElecArea.html", {"aid": aid})

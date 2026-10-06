@@ -119,13 +119,23 @@ AI：✅ 已绑定 校本部/春雪楼2/8层/A-8-17
 
 ### 方式一：一键更新（推荐，WXWork 5.0.11+ 实测可用）
 
-双击仓库里的 `tools/更新电费凭证.bat`（首次先 `pip install pycryptodome websocket-client`，并 `setx ASTRBOT_PASS "机器人密码"` 免输入）。脚本会：
+双击仓库里的 `tools/更新电费凭证.bat`（首次先 `pip install pycryptodome websocket-client`）。脚本会：
 
 1. 自动**带调试口重启企业微信**（登录态保留，一般不用扫码）
 2. 提示你在客户端里**点开一次**「网上缴学杂费 / 校园一卡通」页面——这是唯一需要动手的一步
 3. 通过 CDP（Chrome DevTools 协议）直接从 webview 内存读出 `JSESSIONID`，学校验活通过后**自动私聊推给机器人**并回显结果
+4. 结束后自动清理临时快照，并把企业微信**还原为普通实例**（关掉调试口）
 
-等价的命令行：`python tools/extract_cookie.py --host pay2.hjnu.edu.cn --auto --push`
+机器人地址与账号**不写死在脚本里**，从环境变量读取（不设则推送前报错并给出提示）：
+
+```bat
+setx ASTRBOT_URL "http://你的服务器:6185"
+setx ASTRBOT_USER "你的账号"
+setx ASTRBOT_PASS "机器人密码"
+```
+
+等价的命令行：`python tools/extract_cookie.py --host pay2.hjnu.edu.cn --auto --push`。
+控制台默认**掩码显示**凭证（只露前 8 位），要看完整值加 `--no-mask`。
 
 ### 方式二：手动提取（老版本企业微信 / CDP 不可用时）
 
@@ -254,6 +264,7 @@ python -m pytest -q
 
 | 版本 | 日期 | 要点 |
 |---|---|---|
+| 1.2.0 | 2026-10-06 | 全面审查修复：确认码不回显 AI、重试/预警/轮询可靠性、坏配置自愈、main.py 拆五个模块、凭证工具脱敏（环境变量 + 掩码）、Chart.js SRI |
 | 1.1.7 | 2026-10-05 | 幕后指令注入（聊到电费必调工具）；WebUI 只读仪表盘；分费种预警线（全局+会话）；每日播报显示 24h 充值 |
 | 1.1.6 | 2026-10-04 | 会话级预警线（「低于 20 提醒我」）+ 每日播报免打扰（静音 scope 化） |
 | 1.1.5 | 2026-10-04 | 改绑一步到位（一码换房）；「还能撑几天」估算；自检对话化；趋势上限 60 天 |

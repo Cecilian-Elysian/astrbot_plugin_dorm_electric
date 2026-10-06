@@ -414,7 +414,8 @@ def test_bind_room_reuses_code_for_same_room():
     first = _code_of(plugin)
     text = _call(plugin, plugin.tool_dorm_electric_bind_room(event, 5))
     assert _code_of(plugin) == first
-    assert "仍是" in text
+    assert "已经发过" in text
+    assert first not in text  # 工具回给 LLM 的内容不得含验证码原文
     assert len(event.sent) == 1  # 不重复骚扰用户
 
 
@@ -512,7 +513,8 @@ def test_bind_room_hint_same_room_reminds_old_code():
         plugin, plugin.tool_dorm_electric_bind_room(event, hint="春雪楼2 8层 A817")
     )
     assert _code_of(plugin) == first
-    assert "仍是" in text
+    assert "已经发过" in text
+    assert first not in text  # 工具回给 LLM 的内容不得含验证码原文
     assert len(event.sent) == 1  # 不重复骚扰用户
 
 

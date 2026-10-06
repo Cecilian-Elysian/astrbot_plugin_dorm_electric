@@ -1,6 +1,6 @@
 """数据源接口与通用数据结构。"""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -15,7 +15,6 @@ class BalanceResult:
     value: float | None
     raw: str
     session_expired: bool = False
-    extra: dict = field(default_factory=dict)
     unit: str = "度"
 
 
@@ -25,8 +24,6 @@ class QueryError(Exception):
 
 class ElecProvider:
     """余额数据源接口，所有数据源实现 fetch()。"""
-
-    name = "base"
 
     async def fetch(self, binding: dict) -> BalanceResult:
         raise NotImplementedError

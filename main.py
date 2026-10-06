@@ -187,7 +187,7 @@ def electric():
     PLUGIN_NAME,
     "Cecilian",
     "宿舍电费余额监控预警：低余额预警、每日播报、双费种同时查询、支持 AI 对话绑定与 WebUI 仪表盘",
-    "1.1.7",
+    "1.2.0",
 )
 class DormElectricPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -1005,6 +1005,8 @@ class DormElectricPlugin(Star):
         if elec:
             fees["elec"] = elec
         binding = {
+            # 历史字段：现在只有 hjnu 一个数据源，_fetch_fees 也不再读它，
+            # 保留只为兼容旧 history.json 里已写入的记录，别删（删了 load 老文件会缺键）。
             "provider": "hjnu",
             "room_label": label,
             "params": ac_params,
@@ -1409,13 +1411,17 @@ class DormElectricPlugin(Star):
                 )
             )
             return (
-                f"已向用户发出从 {prev_label} 改绑到 {label} 的确认码（{token['code']}）。"
+                f"已向用户发出从 {prev_label} 改绑到 {label} 的确认码"
+                "（用户私聊窗口可见）。"
                 "不要复述这串数字，等用户回复后你调用 dorm_electric_confirm(code=用户回复的码)。"
             )
         if pending and pending.get("action") == "bind":
             old_rid = ((pending.get("wizard") or {}).get("room") or {}).get("roomid")
             if old_rid is not None and old_rid == room_id:
-                return f"{label} 的绑定验证码仍是 {pending['code']}，请让用户回复这个验证码。"
+                return (
+                    f"{label} 的绑定确认码已经发过（用户私聊窗口可见，未过期）。"
+                    "请让用户直接回复那个验证码，不要让用户重复发起。"
+                )
         token = self._issue_token(
             umo, "bind", room_no=index, label=label, wizard=snapshot
         )
@@ -1427,7 +1433,7 @@ class DormElectricPlugin(Star):
             )
         )
         return (
-            f"已向用户直接发出 {label} 的确认码（{token['code']}）。"
+            f"已向用户直接发出 {label} 的确认码（用户私聊窗口可见）。"
             "不要复述这串数字，等用户回复后你调用 dorm_electric_confirm(code=用户回复的码)。"
         )
 
@@ -1446,7 +1452,10 @@ class DormElectricPlugin(Star):
         label = self._binding_label(binding)
         pending = self._bind_tokens.get(umo)
         if pending and pending.get("action") == "unbind":
-            return f"解绑 {label} 的验证码仍是 {pending['code']}，请让用户回复这个验证码。"
+            return (
+                f"解绑 {label} 的确认码已经发过（用户私聊窗口可见，未过期）。"
+                "请让用户直接回复那个验证码，不要让用户重复发起。"
+            )
         token = self._issue_token(umo, "unbind", label=label)
         await event.send(
             MessageChain().message(
@@ -1456,7 +1465,7 @@ class DormElectricPlugin(Star):
             )
         )
         return (
-            f"已向用户直接发出解绑 {label} 的确认码（{token['code']}）。"
+            f"已向用户直接发出解绑 {label} 的确认码（用户私聊窗口可见）。"
             "不要复述这串数字，等用户回复后你调用 dorm_electric_confirm(code=用户回复的码)。"
         )
 
@@ -1604,6 +1613,10 @@ class DormElectricPlugin(Star):
         s = scope_map.get(s, "")
         if not s:
             return "scope 只支持 alerts（预警）/ daily（每日播报）/ all（全部）。"
+        try:
+            hours = float(hours)
+        except (TypeError, ValueError):
+            return "hours 需要是一个数字：大于 0 = 静音 N 小时，0 = 查状态，-1 = 解除。"
         write = hours > 0 or hours < 0
         if write and not event.is_private_chat():
             return GROUP_WRITE_DENIED
@@ -1673,6 +1686,15 @@ class DormElectricPlugin(Star):
         k = THRESHOLD_KIND_MAP.get(str(kind or "all").strip().lower(), "")
         if not k:
             return "kind 只支持 ac（空调费）/ elec（宿舍电费）/ all（两者）。"
+        # 模型可能传字符串数字（schema 声明 number 但无强制），入口先归一
+        try:
+            warn = float(warn)
+        except (TypeError, ValueError):
+            return "预警线需要是一个数字（比如 20）。"
+        try:
+            critical = float(critical)
+        except (TypeError, ValueError):
+            critical = 0.0
         binding = self.store.get_binding(umo) if self.store else None
         if warn == 0:
             if binding and binding.get("thresholds"):
@@ -1695,16 +1717,10 @@ class DormElectricPlugin(Star):
                 f"已恢复全局默认预警线：预警 {gw:g} / 紧急 {gc:g}"
                 "（两费种回到全局配置）。"
             )
-        try:
-            w = float(warn)
-        except (TypeError, ValueError):
-            return "预警线需要是一个数字（比如 20）。"
+        w = warn
         if w <= 0:
             return "预警线需要是一个正数（比如 20）。"
-        try:
-            c = float(critical)
-        except (TypeError, ValueError):
-            c = 0.0
+        c = critical
         if c <= 0 or c > w:
             c = w / 2
         kinds = ("ac", "elec") if k == "all" else (k,)

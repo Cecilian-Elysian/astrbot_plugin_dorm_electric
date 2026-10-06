@@ -35,6 +35,10 @@
   没有则提示输入，不落盘。
 - 脚本自身已把 stdout/stderr 切到 UTF-8；若在 PowerShell 5.1 里看到中文乱码，
   那是控制台代码页问题，先执行 `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8`。
+- 隐私：机器人地址/账号从环境变量 ASTRBOT_URL / ASTRBOT_USER 读取（不硬编码），
+  --push 的密码从 ASTRBOT_PASS 读取，没有则提示输入，不落盘；
+  控制台默认掩码显示凭证（只露前 8 位），--no-mask 才打印完整值；
+  --auto 结束后自动清理快照临时目录并把企业微信还原为普通实例（无调试口）。
 """
 
 from __future__ import annotations
@@ -62,8 +66,10 @@ COOKIE_NAME = "JSESSIONID"
 WALKSALT = b"DPAPI"  # Local State 里 encrypted_key 解 base64 后的固定前缀
 
 # ---- 一键更新（--watch/--push）相关默认值 ----
-DEFAULT_BOT_URL = "http://43.143.104.106:6185"
-DEFAULT_BOT_USER = "qxm"
+# 机器人地址与账号不硬编码进脚本（分享仓库时不泄露私人部署信息）：
+# 从环境变量 ASTRBOT_URL / ASTRBOT_USER 读取，也可用 --bot-url/--bot-user 临时覆盖。
+BOT_URL_ENV = "ASTRBOT_URL"
+BOT_USER_ENV = "ASTRBOT_USER"
 DEFAULT_SCHOOL_BASE = "http://pay2.hjnu.edu.cn"
 DEFAULT_AID = "0030000000004301"  # 空调费 aid，仅用于验活探测（--aid 可覆盖）
 DEFAULT_PAY_URL = (
@@ -89,10 +95,11 @@ VERB_WAIT_SECONDS = 20
 MANUAL_WAIT_SECONDS = 300
 
 # ---- 全自动模式（--auto，CDP 捕获通道）----
+# 不加 --remote-allow-origins=*：该开关会让任意网页都能连调试口（DNS 重绑定风险），
+# 本脚本直连 127.0.0.1 的 HTTP /json 端点，不需要它。
 CDP_PORT = 9222
 WXWORK_DEBUG_ARGS = (
     f"--remote-debugging-port={CDP_PORT}",
-    "--remote-allow-origins=*",
     "--no-sandbox",
 )
 AUTO_POLL_SECONDS = 3.0
@@ -462,6 +469,27 @@ def _snapshot_cookie_dbs(wxwork_dir: Path) -> list[Path]:
     return out
 
 
+def _cleanup_snapshots(snaps: list[Path]) -> None:
+    """删除快照临时目录（里面是解密前的 Cookie 库，用完即清，不留在 %TEMP%。"""
+    if not snaps:
+        return
+    shutil.rmtree(snaps[0].parent, ignore_errors=True)
+
+
+def _restore_wxwork(exe: Path) -> None:
+    """捕获结束后收尾：关掉带调试口的实例并拉起正常实例（尽力而为，不阻塞主流程）。"""
+    try:
+        _kill_wxwork()
+        time.sleep(2.0)
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        )
+        subprocess.Popen([str(exe)], creationflags=flags, cwd=str(exe.parent))
+        print("   企业微信已恢复为普通实例（无调试口）。")
+    except OSError as e:
+        print(f"   自动重启企业微信失败（{e}），需要时请手动打开。", file=sys.stderr)
+
+
 def _scan_snapshots(snaps: list[Path], host_filter: str, name: str) -> list[str]:
     """从快照库里解出 cookie 值（验活由调用方做）。"""
     values: list[str] = []
@@ -801,15 +829,33 @@ def classify_reply(text: str) -> str:
     return "unknown"
 
 
+def mask_value(value: str, keep: int = 8) -> str:
+    """控制台展示用的掩码：只露前 8 位，防止凭证整串泄进截图/终端回滚缓冲。"""
+    v = str(value or "")
+    if not v:
+        return "(空)"
+    if len(v) <= keep:
+        return v[:2] + "…"
+    return v[:keep] + f"…（共 {len(v)} 字符）"
+
+
 def _push_and_report(args: argparse.Namespace, value: str) -> int:
     """登录机器人 → 新会话 → 发 /电费 凭证，按回复分类给出结论。"""
-    base = args.bot_url.rstrip("/")
+    base = str(getattr(args, "bot_url", "") or "").rstrip("/")
+    user = str(getattr(args, "bot_user", "") or "")
+    if not base or not user:
+        print(
+            f"✗ 未配置机器人地址/账号。请先设置环境变量 {BOT_URL_ENV} 与 {BOT_USER_ENV}"
+            "（或用 --bot-url/--bot-user 指定）。",
+            file=sys.stderr,
+        )
+        return 3
     print("④ 推送给机器人并验证…")
     password = os.environ.get("ASTRBOT_PASS") or getpass.getpass(
-        f"AstrBot({args.bot_user}) 密码: "
+        f"AstrBot({user}) 密码: "
     )
     try:
-        token = bot_login(base, args.bot_user, password)
+        token = bot_login(base, user, password)
         session_id = bot_new_session(base, token)
         reply = bot_send(base, token, session_id, f"/电费 凭证 {args.name}={value}")
     except (OSError, RuntimeError, ValueError) as e:
@@ -893,7 +939,8 @@ def _run_oneclick(args: argparse.Namespace, wxwork_dir: Path) -> int:
         return 1
 
     if not args.push:
-        print(f"⑤ 捕获到凭证：{args.name}={value}")
+        shown = value if args.no_mask else mask_value(value)
+        print(f"⑤ 捕获到凭证：{args.name}={shown}")
         print("（--push 可把它直接推给机器人）")
         return 0
 
@@ -913,6 +960,7 @@ def _run_auto(args: argparse.Namespace, wxwork_dir: Path) -> int:
 
     exe = find_wxwork_exe(args.wxwork_exe)
     if exe is None:
+        _cleanup_snapshots(snaps)
         print("✗ 未找到 WXWork.exe（--wxwork-exe 可指定路径）。", file=sys.stderr)
         return 2
     print(f"② 带调试口重启企业微信（{exe}）…")
@@ -926,8 +974,24 @@ def _run_auto(args: argparse.Namespace, wxwork_dir: Path) -> int:
             cwd=str(exe.parent),
         )
     except OSError as e:
+        _cleanup_snapshots(snaps)
         print(f"✗ 启动失败：{e}", file=sys.stderr)
         return 2
+    try:
+        return _auto_capture_and_push(args, wxwork_dir, snaps, seen, exe)
+    finally:
+        # 无论成功、失败还是 Ctrl+C：清快照临时目录、把企业微信还原成普通实例
+        _cleanup_snapshots(snaps)
+        _restore_wxwork(exe)
+
+
+def _auto_capture_and_push(
+    args: argparse.Namespace,
+    wxwork_dir: Path,
+    snaps: list[Path],
+    seen: list[str],
+    exe: Path,
+) -> int:
     if not _cdp_wait(AUTO_CDP_BOOT_SECONDS):
         print(
             "✗ 调试口没就绪。若弹出登录窗请先登录（登录态通常保留，一般不用扫码）。",
@@ -951,7 +1015,8 @@ def _run_auto(args: argparse.Namespace, wxwork_dir: Path) -> int:
         return 1
 
     if not args.push:
-        print(f"④ 捕获到凭证：{args.name}={value}")
+        shown = value if args.no_mask else mask_value(value)
+        print(f"④ 捕获到凭证：{args.name}={shown}")
         print("（--push 可把它直接推给机器人）")
         return 0
     return _push_and_report(args, value)
@@ -991,8 +1056,23 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="把（新）凭证自动推送给机器人验证（密码走 ASTRBOT_PASS 环境变量或提示输入）",
     )
-    parser.add_argument("--bot-url", default=DEFAULT_BOT_URL, help="AstrBot 地址")
-    parser.add_argument("--bot-user", default=DEFAULT_BOT_USER, help="AstrBot 账号")
+    parser.add_argument(
+        "--no-mask",
+        action="store_true",
+        help="控制台打印完整凭证值（默认只露前 8 位，避免泄进截图/终端回滚）",
+    )
+    env_url = os.environ.get(BOT_URL_ENV, "")
+    env_user = os.environ.get(BOT_USER_ENV, "")
+    parser.add_argument(
+        "--bot-url",
+        default=env_url,
+        help=f"AstrBot 地址（默认读 {BOT_URL_ENV} 环境变量）",
+    )
+    parser.add_argument(
+        "--bot-user",
+        default=env_user,
+        help=f"AstrBot 账号（默认读 {BOT_USER_ENV} 环境变量）",
+    )
     parser.add_argument(
         "--school-base", default=DEFAULT_SCHOOL_BASE, help="学校缴费系统地址（验活用）"
     )
@@ -1019,7 +1099,7 @@ def main(argv: list[str] | None = None) -> int:
         "--manual-wait",
         type=int,
         default=MANUAL_WAIT_SECONDS,
-        help="人工点开缴费页的等待秒数（默认 120）",
+        help=f"人工点开缴费页的等待秒数（默认 {MANUAL_WAIT_SECONDS}）",
     )
     args = parser.parse_args(argv)
 
@@ -1072,13 +1152,17 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"命中 {len(records)} 条：\n")
     for r in records:
+        shown = r["value"] if args.no_mask else mask_value(r["value"])
         print(f"  域名   {r['host']}")
         print(f"  名称   {r['name']}")
         print(f"  过期   {r['expires']}")
         print(f"  来源   {r['db']}")
-        print(f"  取值   {r['name']}={r['value']}")
+        print(f"  取值   {r['name']}={shown}")
         print()
-    print("把上面「取值」整行私聊发给机器人：/电费 凭证 " + f"{records[0]['name']}={records[0]['value']}")
+    if args.no_mask:
+        print("把上面「取值」整行私聊发给机器人：/电费 凭证 " + f"{records[0]['name']}={records[0]['value']}")
+    else:
+        print("掩码显示中（--no-mask 可看完整值）；推荐直接加 --push 自动推送给机器人验证。")
     print("该凭证是闲置型过期（数小时），插件的 20 分钟轮询会顺带保活；真过期重复上述步骤即可。")
     return 0
 
