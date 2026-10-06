@@ -10,11 +10,8 @@
 """
 
 import asyncio
-import difflib
 import re
-import secrets
 import time
-import unicodedata
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,11 +25,89 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
 try:
+    from . import webui
+    from .formatting import (
+        CREDENTIAL_HINT,
+        ROOM_PAGE_SIZE,
+        alert_hint,
+        credential_state,
+        daily_snapshots,
+        fee_name,
+        fee_text,
+        format_fee_results,
+        history_stats,
+        room_page,
+        room_token,
+    )
     from .providers import HjnuProvider, QueryError, SessionExpiredError
+    from .room_lookup import (
+        HINT_DIGITS_RE,
+        HINT_FLOOR_RE,
+        HINT_ROOM_RE,
+        LAST_ROOM_TTL,
+        LOOKUP_BUILDING_BUDGET,
+        LOOKUP_ROOM_BUDGET,
+        RoomResolver,
+        fuzzy_miss_text,
+        last_room_line,
+        parse_room_hint,
+        remember_room,
+    )
     from .storage import Store
+    from .thresholds import (
+        daily_muted_until,
+        effective_thresholds,
+        set_session_threshold,
+        threshold_lines,
+    )
+    from .tokens import (
+        CODE_LENGTH,
+        generate_code,
+        match_code_reply,
+        pending_view_text,
+    )
 except ImportError:  # 兜底：被以非包方式加载时
+    import webui  # type: ignore
+    from formatting import (  # type: ignore
+        CREDENTIAL_HINT,
+        ROOM_PAGE_SIZE,
+        alert_hint,
+        credential_state,
+        daily_snapshots,
+        fee_name,
+        fee_text,
+        format_fee_results,
+        history_stats,
+        room_page,
+        room_token,
+    )
     from providers import HjnuProvider, QueryError, SessionExpiredError  # type: ignore
+    from room_lookup import (  # type: ignore
+        HINT_DIGITS_RE,
+        HINT_FLOOR_RE,
+        HINT_ROOM_RE,
+        LAST_ROOM_TTL,
+        LOOKUP_BUILDING_BUDGET,
+        LOOKUP_ROOM_BUDGET,
+        RoomResolver,
+        fuzzy_miss_text,
+        last_room_line,
+        parse_room_hint,
+        remember_room,
+    )
     from storage import Store  # type: ignore
+    from thresholds import (  # type: ignore
+        daily_muted_until,
+        effective_thresholds,
+        set_session_threshold,
+        threshold_lines,
+    )
+    from tokens import (  # type: ignore
+        CODE_LENGTH,
+        generate_code,
+        match_code_reply,
+        pending_view_text,
+    )
 
 try:
     from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -43,13 +118,6 @@ except ImportError:
 
 
 PLUGIN_NAME = "astrbot_plugin_dorm_electric"
-
-# 绑定向导里每页显示的房间数。房间多时用 /电费 房间 翻页、/电费 房间 p2 跳页，
-# 选择时仍用全楼层绝对编号，避免超过一页的房间选不到。
-ROOM_PAGE_SIZE = 30
-
-# 待确认项的验证码位数与默认有效期（秒），可被 ai_bind_code_ttl 覆盖。
-CODE_LENGTH = 6
 
 # 预警静音上限（小时）：「静音」只影响提醒推送，随时可逆，不需要验证码。
 ALERT_MUTE_MAX_HOURS = 168
@@ -69,14 +137,6 @@ GROUP_WRITE_DENIED = (
     "请私聊机器人发送 /电费 绑定，我一步步带你弄；"
     "群里可以随时问我查电费余额。"
 )
-
-# 用户回复验证码时的严格格式：整条消息里除了标点只剩验证码。
-# 这样群里有人问「481526 度电够吗」不会被误判成已同意。
-CODE_ONLY_PATTERN = r"[\s，,。.!！?？:：]*{code}[\s，,。.!！?？:：]*"
-
-# 私聊放宽：「确认 481526」「验证码是481526」也算亲手回复。
-# 码是 6 位随机数且按会话隔离，私聊里没有误判对象；群聊仍只用上面的严格格式。
-CODE_KEYWORD_PATTERN = r"(?:确认|验证码|码)\s*[是码:：,，\s]*{code}(?!\d)"
 
 # —— AI 触达（幕后指令注入）——
 # 用户消息或近几轮上下文命中这些词时，才把 AI_ELECTRIC_HINT 追加进 system_prompt。
@@ -109,13 +169,6 @@ def _llm_request_hook():
     if deco is None:
         return lambda func: func
     return deco()
-
-CREDENTIAL_HINT = (
-    "🔐 学校系统凭证已失效或尚未配置。\n"
-    "重新获取 JSESSIONID 后私聊发送：/电费 凭证 JSESSIONID=xxxx\n"
-    "（获取方式：企业微信打开缴费查询页让 Cookie 入库，再运行仓库内 "
-    "tools/extract_cookie.py 提取，详见 README）"
-)
 
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -300,9 +353,17 @@ class DormElectricPlugin(Star):
             "room", "未知房间"
         )
 
-    @staticmethod
-    def _fee_name(kind: str) -> str:
-        return "空调费" if kind == "ac" else "宿舍电费"
+    # ---- 纯格式化/统计函数：实现已平移到 formatting.py，这里保留静态方法别名，
+    # ---- self._fee_name(...) 等全部调用点与测试引用（DormElectricPlugin._x）不变。
+    _fee_name = staticmethod(fee_name)
+    _fee_text = staticmethod(fee_text)
+    _format_fee_results = staticmethod(format_fee_results)
+    _alert_hint = staticmethod(alert_hint)
+    _room_page = staticmethod(room_page)
+    _room_token = staticmethod(room_token)
+    _daily_snapshots = staticmethod(daily_snapshots)
+    _history_stats = staticmethod(history_stats)
+    _credential_state = staticmethod(credential_state)
 
     def _fee_bindings(self, binding: dict) -> dict:
         fees = binding.get("fees")
@@ -364,54 +425,6 @@ class DormElectricPlugin(Star):
     @staticmethod
     def _fee_entry(params: dict) -> dict:
         return {"provider": "hjnu", "params": params}
-
-    def _format_fee_results(
-        self, results: dict[str, object], include_missing: bool = False
-    ) -> list[str]:
-        """把查询结果格式化成按费种分行的文本。
-
-        include_missing=True 时把「连响应都没有」（网络/学校 5xx）的费种也列出来，
-        /电费 检查 用它来避免明细整段空白、看不出是哪一路失败。
-        """
-        lines = []
-        for kind in ("ac", "elec"):
-            result = results.get(kind)
-            if result is None:
-                if include_missing:
-                    lines.append(
-                        f"{self._fee_name(kind)}：❌ 未取到响应（网络异常或学校无响应）"
-                    )
-                continue
-            if result.ok and result.value is not None:
-                lines.append(self._fee_text(kind, result))
-            elif result.session_expired:
-                lines.append(f"{self._fee_name(kind)}：凭证已失效")
-            else:
-                lines.append(f"{self._fee_name(kind)}：查询失败（{result.raw}）")
-        return lines
-    @staticmethod
-    def _fee_text(kind: str, result) -> str:
-        return f"{DormElectricPlugin._fee_name(kind)}：{result.value:.2f} {result.unit}"
-
-    @staticmethod
-    def _room_page(
-        rooms: list, page: int, page_size: int = ROOM_PAGE_SIZE
-    ) -> tuple[int, int, int]:
-        """房间列表分页：返回 (起始下标, 结束下标, 总页数)，页码自动夹到有效范围。"""
-        total = len(rooms)
-        total_pages = max(1, -(-total // page_size))
-        try:
-            page = int(page)
-        except (TypeError, ValueError):
-            page = 1
-        page = max(1, min(total_pages, page))
-        start = (page - 1) * page_size
-        return start, min(start + page_size, total), total_pages
-
-    @staticmethod
-    def _room_token(room_name: str) -> str | None:
-        m = re.search(r"([A-Za-z]+)[-_](\d+)[-_](\d+)", room_name or "")
-        return "".join(m.groups()) if m else None
 
     async def _match_elec_fee(self, ac_params: dict) -> dict | None:
         """按楼栋、楼层和房间编号自动寻找宿舍电费对应房间。"""
@@ -526,69 +539,14 @@ class DormElectricPlugin(Star):
     def _effective_thresholds(
         self, binding: dict | None, kind: str = "ac"
     ) -> tuple[float, float]:
-        """生效预警线（按费种）。
-
-        优先级：会话 per-fee 自定义 > 全局 per-fee 配置（threshold_warn_ac 等）
-        > 全局旧配置（threshold_warn/critical，两费种共用，老用户零感知）。
-        会话存储兼容两代格式：新 {"ac": {warn, critical}, "elec": {…}} 只存
-        自定义过的费种；旧 {"warn":…, "critical":…} 视为两费种共用。
-        """
-        warn = (
-            self._cfg_float(f"threshold_warn_{kind}", 0)
-            or self._cfg_float("threshold_warn", 10)
-        )
-        critical = (
-            self._cfg_float(f"threshold_critical_{kind}", 0)
-            or self._cfg_float("threshold_critical", 5)
-        )
-        if critical > warn:
-            warn, critical = critical, warn
-        t = (binding or {}).get("thresholds") or {}
-        if not isinstance(t, dict):
-            t = {}
-        ft = t.get(kind)
-        if not isinstance(ft, dict):
-            # legacy：整份 flat dict 就是两费种共用的自定义值
-            ft = t if ("warn" in t or "critical" in t) else {}
-        try:
-            w = float(ft.get("warn") or 0)
-        except (TypeError, ValueError):
-            w = 0.0
-        try:
-            c = float(ft.get("critical") or 0)
-        except (TypeError, ValueError):
-            c = 0.0
-        if w > 0:
-            warn = w
-            critical = c if 0 < c <= warn else w / 2
-        return warn, critical
+        return effective_thresholds(self._cfg_float, binding, kind)
 
     def _threshold_lines(self, binding: dict | None) -> list[str]:
-        """两费种生效预警线展示行（balance / 预警线状态 / 配置摘要共用）。"""
-        lines = []
-        for kind in ("ac", "elec"):
-            unit = "度" if kind == "ac" else "元"
-            w, c = self._effective_thresholds(binding, kind)
-            lines.append(
-                f"{self._fee_name(kind)}：预警 {w:g} {unit} / 紧急 {c:g} {unit}"
-            )
-        return lines
+        return threshold_lines(self._cfg_float, binding)
 
-    @staticmethod
-    def _set_session_threshold(
-        binding: dict, kind: str, warn: float, critical: float
-    ) -> None:
-        """写一条会话 per-fee 自定义预警线（新格式，只动指定费种）。"""
-        binding.setdefault("thresholds", {})[kind] = {
-            "warn": warn,
-            "critical": critical,
-        }
+    _set_session_threshold = staticmethod(set_session_threshold)
 
-    def _daily_muted_until(self, binding: dict | None) -> float:
-        try:
-            return float((binding or {}).get("daily_muted_until") or 0)
-        except (TypeError, ValueError):
-            return 0.0
+    _daily_muted_until = staticmethod(daily_muted_until)
 
     async def _evaluate_alerts(
         self, umo: str, binding: dict, value: float, kind: str = "ac", unit: str = "度"
@@ -752,80 +710,6 @@ class DormElectricPlugin(Star):
                 line += f"（24h 检测到充值 +{stats['recharged_24h']:.2f} {unit}）"
             lines.append(line)
         return "\n".join(lines) if len(lines) > 1 else None
-
-    @staticmethod
-    def _daily_snapshots(
-        history: list[dict], tz: timezone, days: int
-    ) -> list[tuple[Any, dict | None]]:
-        """按本地日期取「日末快照」：每天时间戳最大的一条记录。
-
-        返回从今天往前共 days 个自然日的 (date, 记录|None)，
-        最新日期在前，当天无记录的日期为 None。
-        """
-        by_date: dict[Any, dict] = {}
-        for h in history:
-            d = datetime.fromtimestamp(float(h["t"]), tz).date()
-            prev = by_date.get(d)
-            if prev is None or float(h["t"]) >= float(prev["t"]):
-                by_date[d] = h
-        today = datetime.now(tz).date()
-        snapshots: list[tuple[Any, dict | None]] = []
-        for i in range(days):
-            d = today - timedelta(days=i)
-            snapshots.append((d, by_date.get(d)))
-        return snapshots
-
-    @staticmethod
-    def _history_stats(history: list[dict]) -> dict | None:
-        """计算 24h 用电、24h 充值、日均、最低/最高。
-
-        余额序列中下降段计为用电、上升段计为充值，避免中途充值
-        导致用电量被低估甚至算成 0。
-        """
-        if len(history) < 1:
-            return None
-        values = [float(h["v"]) for h in history]
-        ts = [float(h["t"]) for h in history]
-        unit = history[-1].get("u", "度")
-        now = time.time()
-        min_v = min(values)
-        max_v = max(values)
-
-        # 24h 窗口：起点为最接近 (now-24h) 时刻的样本
-        start = 0
-        for i, h in enumerate(history):
-            if now - float(h["t"]) >= 24 * 3600:
-                start = i
-            else:
-                break
-        usage_24h = 0.0
-        recharged_24h = 0.0
-        for i in range(start + 1, len(history)):
-            delta = values[i - 1] - values[i]
-            if delta > 0:
-                usage_24h += delta
-            else:
-                recharged_24h += -delta
-
-        # 日均：按全历史跨度的下降段之和
-        span_days = (ts[-1] - ts[0]) / 86400
-        per_day = 0.0
-        if span_days >= 0.5 and len(history) >= 2:
-            total_usage = 0.0
-            for i in range(1, len(history)):
-                delta = values[i - 1] - values[i]
-                if delta > 0:
-                    total_usage += delta
-            per_day = total_usage / span_days
-
-        return {
-            "usage_24h": usage_24h,
-            "recharged_24h": recharged_24h,
-            "per_day": per_day,
-            "min": min_v,
-            "max": max_v,
-            "unit": unit,
-        }
 
     def _record_event(self, umo: str, kind: str, text: str) -> None:
         """记录一条事件到内存事件流。"""
@@ -1172,7 +1056,7 @@ class DormElectricPlugin(Star):
         """生成待确认项；同一会话只保留最新一个，旧码立即作废。"""
         self._purge_tokens()
         token = {
-            "code": f"{secrets.randbelow(900000) + 100000:0{CODE_LENGTH}d}",
+            "code": generate_code(),
             "action": action,
             "at": time.time(),
             "user_ok": False,
@@ -1193,21 +1077,7 @@ class DormElectricPlugin(Star):
         token = self._bind_tokens.get(umo)
         if not token:
             return "当前会话没有待确认的操作。"
-        left = max(0, int(self._token_ttl() - (time.time() - token["at"])))
-        action = str(token.get("action", "bind"))
-        if action == "bind":
-            what = f"绑定到 {token['label']}"
-        elif action == "rebind":
-            prev = token.get("prev_label")
-            what = f"改绑到 {token['label']}" + (f"（原 {prev}）" if prev else "")
-        else:
-            what = f"解绑 {token['label']}"
-        return (
-            f"⏳ 待确认：{what}\n"
-            f"验证码：{token['code']}（剩余 {left // 60} 分 {left % 60} 秒，"
-            f"{'已收到你的确认' if token['user_ok'] else '等你回复验证码'}）\n"
-            f"回复这个 {CODE_LENGTH} 位数字即可完成，或发 /电费 确认 {token['code']}"
-        )
+        return pending_view_text(token, self._token_ttl())
 
     def _take_token(self, umo: str, code: str) -> tuple[dict | None, str | None]:
         """校验并消费待确认项。user_ok 必须由用户亲手回复验证码才置位。"""
@@ -1271,16 +1141,9 @@ class DormElectricPlugin(Star):
         if not token or token.get("user_ok"):
             return
         text = str(getattr(event, "message_str", "") or "").strip()
-        if not text:
-            return
-        code = re.escape(token["code"])
-        # 私聊放宽：带「确认/验证码/码」关键词且数字与待确认码一致也算亲手回复。
+        # 裸码全场景；「确认/验证码/码 + 码」关键词形式仅私聊（匹配逻辑在 tokens.py）。
         # 码是 6 位随机数、按会话隔离，私聊没有误判对象；群聊维持严格格式。
-        bare_ok = bool(re.fullmatch(CODE_ONLY_PATTERN.format(code=code), text))
-        keyword_ok = event.is_private_chat() and bool(
-            re.search(CODE_KEYWORD_PATTERN.format(code=code), text)
-        )
-        if not (bare_ok or keyword_ok):
+        if not match_code_reply(text, token["code"], event.is_private_chat()):
             return
         token["user_ok"] = True
         self._record_event(
@@ -1625,14 +1488,6 @@ class DormElectricPlugin(Star):
             + ("（已关闭）" if not poll else "")
         )
 
-    @staticmethod
-    def _alert_hint(value: float, warn: float, critical: float) -> str:
-        if value <= critical:
-            return f"⚠️ 已低于紧急线 {critical:g}，建议马上充值。"
-        if value <= warn:
-            return f"⚠️ 已低于预警线 {warn:g}，建议尽快充值。"
-        return "✅ 高于预警线，状态正常。"
-
     @filter.llm_tool(name="dorm_electric_balance")
     async def tool_dorm_electric_balance(
         self, event: AstrMessageEvent, days: int = 0
@@ -1904,300 +1759,39 @@ class DormElectricPlugin(Star):
             lines.append("  （暂无历史数据，等轮询几轮就有了）")
         return lines
 
-    # 房间名反查：A-8-17 / A817 / 春雪楼2 8层 A817
-    HINT_ROOM_RE = re.compile(r"([A-Za-z]+)[-_ ]?(\d+)(?:[-_ ]?(\d+))?")
-    HINT_FLOOR_RE = re.compile(r"(\d+)\s*层")
-    HINT_DIGITS_RE = re.compile(r"\d{3,4}")
-    LOOKUP_BUILDING_BUDGET = 12
-    LOOKUP_ROOM_BUDGET = 12
-    LAST_ROOM_TTL = 1800  # 会话房间记忆 30 分钟
+    # 房间名反查：解析/扫描/模糊反问在 room_lookup.py；这里保留类级别名与薄委托，
+    # 供测试与老调用点（plugin.HINT_ROOM_RE、plugin.LOOKUP_ROOM_BUDGET 等）使用。
+    HINT_ROOM_RE = HINT_ROOM_RE
+    HINT_FLOOR_RE = HINT_FLOOR_RE
+    HINT_DIGITS_RE = HINT_DIGITS_RE
+    LOOKUP_BUILDING_BUDGET = LOOKUP_BUILDING_BUDGET
+    LOOKUP_ROOM_BUDGET = LOOKUP_ROOM_BUDGET
+    LAST_ROOM_TTL = LAST_ROOM_TTL  # 会话房间记忆 30 分钟
 
     def _remember_room(self, umo: str, params: dict) -> None:
-        """定位成功后记下本会话的房间，供「绑定」「春雪」这类碎片说法复用。"""
-        label = "/".join(
-            str(params[scope].get(key, ""))
-            for scope, key in (
-                ("area", "areaname"),
-                ("building", "building"),
-                ("floor", "floor"),
-                ("room", "room"),
-            )
-        )
-        self._last_room[umo] = {"params": params, "label": label, "at": time.time()}
+        remember_room(self._last_room, umo, params)
 
     def _last_room_line(self, umo: str) -> str:
-        """未解析出房间时的追加提示：告诉 AI 本会话最近定位过哪个房间、怎么重调。"""
-        last = self._last_room.get(umo)
-        if not last or time.time() - float(last.get("at", 0)) > self.LAST_ROOM_TTL:
-            return ""
-        room_name = (last.get("params", {}).get("room") or {}).get("room", "")
-        if not room_name:
-            return ""
-        minutes = max(1, int((time.time() - float(last["at"])) // 60))
-        return (
-            f"\n\n本会话 {minutes} 分钟前定位过 {last['label']}。"
-            f"如果用户指的就是它（比如用户刚说「绑定」「查电费」），"
-            f"直接用 hint 传「{room_name}」重新调用本工具，不要反问。"
-        )
+        return last_room_line(self._last_room, umo)
 
     @classmethod
     def _parse_room_hint(cls, hint: str) -> tuple[str, str]:
-        """从口语里抽出房间 token（A817 / 817）与楼层号（8）。
+        return parse_room_hint(hint)
 
-        「A-8-17」自带楼层段；「A817」这类紧凑写法再从「8层」里捞楼层；
-        「春雪楼817」「817」这类没有字母的说法走纯数字回退，首位数字当楼层。
-        全角数字先 NFKC 归一。都没有就留空，由 _resolve_room 按受限的逐层搜索去找。
-        """
-        text = unicodedata.normalize("NFKC", str(hint or ""))
-        m = cls.HINT_ROOM_RE.search(text)
-        if not m:
-            digits = cls.HINT_DIGITS_RE.search(text)
-            if not digits:
-                return "", ""
-            token = digits.group(0)
-            first = token[0]
-            return token, ("" if first == "0" else first)
-        letters, second, third = m.groups()
-        token = f"{letters}{second}{third or ''}"
-        if third:
-            return token, second.lstrip("0")
-        floor = cls.HINT_FLOOR_RE.search(text)
-        if floor:
-            return token, floor.group(1).lstrip("0")
-        return token, ""
-
+    def _resolver(self) -> RoomResolver:
+        return RoomResolver(
+            hjnu=self.hjnu,
+            store=self.store,
+            config=self.config,
+            last_room=self._last_room,
+        )
 
     async def _resolve_room(self, umo: str, hint: str) -> tuple[dict | None, str | None]:
-        """按房间名反查学校侧的房间参数。返回 (ac_params, err)。
-
-        搜索有请求预算上限（学校接口每层一次请求，全校扫一遍要几十次）：
-        给了楼层就只在匹配楼层找；没给楼层就按「先每栋楼第一层、再每栋楼第二层」
-        的顺序轮转，命中不了就反问用户补楼栋和楼层。
-        """
-        token, floor_no = self._parse_room_hint(hint)
-        if not token:
-            return None, (
-                "没认出房间号。可以说「春雪楼817」「817」「A817」「A-8-17」或"
-                "「春雪楼2 8层 A817」这类格式。" + self._last_room_line(umo)
-            )
-        items = self.config.get("fee_items", {}) or {}
-        aids = list(items)
-        if not aids:
-            return None, "配置中没有任何缴费项目（fee_items）。"
-        aid = aids[0]
-        try:
-            areas = await self.hjnu.list_areas(aid)
-            area = next(
-                (a for a in areas if a.get("areaname") == "校本部"),
-                (areas or [None])[0],
-            )
-            if not area:
-                return None, "学校没有返回校区列表。"
-            buildings = await self.hjnu.list_buildings(aid, area)
-        except SessionExpiredError:
-            return None, CREDENTIAL_HINT
-        except QueryError as e:
-            return None, f"❌ {e}"
-        if not buildings:
-            return None, "学校没有返回楼栋列表。"
-        text = str(hint)
-        order: list[dict] = []
-        # 优先级：提示里点名的楼栋 > 本会话已绑定的楼栋 > 其余
-        named = next(
-            (b for b in buildings if b.get("building") and b["building"] in text), None
-        )
-        if not named:
-            # 「春雪楼817」点不出完整楼名「春雪楼2」：楼栋名去掉数字后再匹配一次
-            named = next(
-                (
-                    b
-                    for b in buildings
-                    if b.get("building") and re.sub(r"\d", "", str(b["building"])) in text
-                ),
-                None,
-            )
-        if named:
-            order.append(named)
-        bound = self.store.get_binding(umo) if self.store else None
-        bound_name = (bound or {}).get("params", {}).get("building", {}).get("building")
-        if bound_name:
-            same = next((b for b in buildings if b.get("building") == bound_name), None)
-            if same and same not in order:
-                order.append(same)
-        order.extend(b for b in buildings if b not in order)
-        order = order[: self.LOOKUP_BUILDING_BUDGET]
-
-        async def floors_of(building: dict) -> list[dict]:
-            try:
-                return await self.hjnu.list_floors(aid, area, building)
-            except SessionExpiredError:
-                raise
-            except QueryError:
-                return []
-
-        try:
-            floors_by_building = list(
-                zip(order, await asyncio.gather(*(floors_of(b) for b in order)), strict=False)
-            )
-        except SessionExpiredError:
-            # 扫描途中会话过期：报「凭证过期」而不是「没找到房间」，避免误导
-            return None, CREDENTIAL_HINT
-        pairs: list[tuple[dict, dict]] = []
-        # 「A817」这类 token 不带楼层：从去字母后的首个非零数字猜楼层，猜中的排最前
-        # （软优先，只影响扫描顺序不影响正确性；猜错就按原轮转顺序兜底）。
-        guess_floor = ""
-        if not floor_no:
-            digits_part = re.sub(r"^[A-Za-z]+", "", token)
-            g = re.search(r"[1-9]", digits_part)
-            guess_floor = g.group(0) if g else ""
-        if floor_no:
-            for building, floors in floors_by_building:
-                floor = next(
-                    (
-                        f
-                        for f in floors
-                        if str(f.get("floor", "")).replace("层", "").strip() == floor_no
-                    ),
-                    None,
-                )
-                if floor:
-                    pairs.append((building, floor))
-        else:
-            picked: set[tuple[str, str]] = set()
-
-            def pick(b: dict, f: dict) -> None:
-                key = (str(b.get("building")), str(f.get("floor")))
-                if key not in picked and len(pairs) < self.LOOKUP_ROOM_BUDGET:
-                    picked.add(key)
-                    pairs.append((b, f))
-
-            if guess_floor:
-                for building, floors in floors_by_building:
-                    floor = next(
-                        (
-                            f
-                            for f in floors
-                            if str(f.get("floor", "")).replace("层", "").strip()
-                            == guess_floor
-                        ),
-                        None,
-                    )
-                    if floor:
-                        pick(building, floor)
-            depth = 0
-            while len(pairs) < self.LOOKUP_ROOM_BUDGET:
-                added = False
-                for building, floors in floors_by_building:
-                    if len(floors) > depth:
-                        pick(building, floors[depth])
-                        added = True
-                        if len(pairs) >= self.LOOKUP_ROOM_BUDGET:
-                            break
-                if not added:
-                    break
-                depth += 1
-        pairs = pairs[: self.LOOKUP_ROOM_BUDGET]
-        if not pairs:
-            if floor_no:
-                scope = f"{named['building']} " if named else "学校那边"
-                return None, (
-                    f"{scope}没有 {floor_no} 层（关键词 {token}）。"
-                    "请让用户确认楼栋和楼层，例如「春雪楼2 8层 A817」。"
-                )
-            return None, (
-                f"在学校里没找到关键词 {token} 对应的房间。请让用户补全楼栋和楼层，"
-                "例如「春雪楼2 8层 A817」。"
-            )
-
-
-        async def rooms_of(pair: tuple[dict, dict]) -> tuple[dict, dict, list[dict]]:
-            building, floor = pair
-            try:
-                return building, floor, await self.hjnu.list_rooms(
-                    aid, area, building, floor
-                )
-            except SessionExpiredError:
-                raise
-            except QueryError:
-                return building, floor, []
-
-        try:
-            results = await asyncio.gather(*(rooms_of(p) for p in pairs))
-        except SessionExpiredError:
-            return None, CREDENTIAL_HINT
-
-        def norm_name(room: dict) -> str:
-            return re.sub(r"[^A-Za-z0-9]", "", str(room.get("room", ""))).lower()
-
-        def strict_match(t: str) -> list[tuple[dict, dict, dict]]:
-            needle = re.sub(r"[^A-Za-z0-9]", "", str(t)).lower()
-            out: list[tuple[dict, dict, dict]] = []
-            for building, floor, rooms in results:
-                for room in rooms:
-                    if needle and needle in norm_name(room):
-                        out.append((building, floor, room))
-                        break
-            return out
-
-        hits = strict_match(token)
-        if not hits:
-            # 「A-08-17」这类前导零写法：去掉数字段里的前导零再试一次
-            alt = re.sub(r"(^|[^0-9])0+(\d)", r"\1\2", token)
-            if alt != token:
-                hits = strict_match(alt)
-                if hits:
-                    token = alt
-        if not hits:
-            scanned: list[tuple[str, dict, dict, dict]] = []
-            for building, floor, rooms in results:
-                for room in rooms:
-                    scanned.append((norm_name(room), building, floor, room))
-            return None, self._fuzzy_miss_text(token, scanned)
-        if len(hits) > 1:
-            options = "、".join(
-                f"{b.get('building')}/{f.get('floor')}/{r.get('room')}"
-                for b, f, r in hits[:8]
-            )
-            return None, f"找到多个匹配的房间：{options}。请反问用户是哪一个。"
-        building, floor, room = hits[0]
-        params = {
-            "aid": aid,
-            "area": area,
-            "building": building,
-            "floor": floor,
-            "room": room,
-        }
-        self._remember_room(umo, params)
-        return params, None
+        return await self._resolver().resolve(umo, hint)
 
     @staticmethod
     def _fuzzy_miss_text(token: str, scanned: list[tuple[str, dict, dict, dict]]) -> str:
-        """严格匹配落空时的回复：有近似房间就列出来让 AI 反问，没有才回格式引导。
-
-        只在本次已扫描到的房间里算相似度（difflib，零额外请求）；永远不直接
-        采用猜测结果——候选交给用户确认后，AI 必须用完整房间名重新调用。
-        """
-        if scanned:
-            by_name: dict[str, tuple[dict, dict, dict]] = {}
-            for name, building, floor, room in scanned:
-                by_name.setdefault(name, (building, floor, room))
-            close = difflib.get_close_matches(
-                re.sub(r"[^A-Za-z0-9]", "", str(token)).lower(),
-                list(by_name),
-                n=5,
-                cutoff=0.6,
-            )
-            if close:
-                options = "、".join(
-                    f"{by_name[n][0].get('building')}/"
-                    f"{by_name[n][1].get('floor')}/{by_name[n][2].get('room')}"
-                    for n in close
-                )
-                return (
-                    f"学校里没有完全叫「{token}」的房间。最接近的是：{options}。"
-                    "请反问用户是哪一个，确认后用完整房间名重新调用。"
-                )
-        return f"没找到房间号包含 {token} 的房间，请让用户确认一下房间号。"
+        return fuzzy_miss_text(token, scanned)
 
 
     async def _query_room_balance(self, umo: str, hint: str) -> str:
@@ -2263,6 +1857,7 @@ class DormElectricPlugin(Star):
 
 
     # ================= WebUI 仪表盘（只读） =================
+    # 实现在 webui.py；这里只保留方法壳，供注册表与测试沿用旧入口。
     # AstrBot 插件页面机制：context.register_web_api 注册带 WebUI 登录鉴权的
     # REST 端点；pages/dashboard/ 下的前端经 window.AstrBotPluginPage Bridge
     # 调用（apiGet("dashboard/overview") → /插件名/dashboard/overview）。
@@ -2270,107 +1865,19 @@ class DormElectricPlugin(Star):
     # 任何响应都不得包含 cookie 值（有测试断言）。
 
     def _register_dashboard(self):
-        reg = getattr(self.context, "register_web_api", None)
-        if not callable(reg):
-            logger.info(f"[{PLUGIN_NAME}] 宿主不支持 register_web_api，仪表盘端点未注册")
-            return
-        base = f"/{PLUGIN_NAME}/dashboard"
-        try:
-            reg(f"{base}/overview", self._web_overview, ["GET"], "电费仪表盘概览")
-            reg(f"{base}/history", self._web_history, ["GET"], "电费仪表盘历史")
-        except Exception as e:
-            logger.warning(f"[{PLUGIN_NAME}] 仪表盘端点注册失败：{e!r}")
+        webui.register_dashboard(self)
 
     def _web_binding_item(self, umo: str, binding: dict) -> dict:
         """单个绑定的仪表盘数据（纯数据，无任何凭证字段）。"""
-        fees = {}
-        for kind in ("ac", "elec"):
-            history = (binding.get("history_by_fee") or {}).get(kind) or []
-            latest = history[-1] if history else None
-            try:
-                latest_value = float(latest["v"]) if latest else None
-            except (TypeError, ValueError, KeyError):
-                latest_value = None
-            stats = self._history_stats(history)
-            warn, critical = self._effective_thresholds(binding, kind)
-            fees[kind] = {
-                "name": self._fee_name(kind),
-                "unit": (latest or {}).get("u", "度" if kind == "ac" else "元"),
-                "latest_value": latest_value,
-                "latest_time": float(latest["t"]) if latest else None,
-                "warn": warn,
-                "critical": critical,
-                "custom": bool(
-                    isinstance(binding.get("thresholds"), dict)
-                    and isinstance(binding["thresholds"].get(kind), dict)
-                ),
-                "per_day": stats["per_day"] if stats else 0.0,
-                "recharged_24h": stats["recharged_24h"] if stats else 0.0,
-                "points": len(history),
-            }
-        return {
-            "umo": umo,
-            "label": self._binding_label(binding),
-            "fees": fees,
-            "alert_muted_until": float(self._alert_muted.get(umo, 0) or 0),
-            "daily_muted_until": self._daily_muted_until(binding),
-        }
+        return webui.binding_item(self, umo, binding)
 
     async def _web_overview(self):
         """仪表盘概览：全部绑定 + 全局状态。"""
-        try:
-            bindings = (self.store.data.get("bindings", {}) if self.store else {}) or {}
-            cookie = str(self.config.get("hjnu_cookie", "") or "")
-            return {
-                "success": True,
-                "data": {
-                    "bindings": [
-                        self._web_binding_item(umo, b) for umo, b in bindings.items()
-                    ],
-                    "cookie_ok": bool(cookie.strip()),
-                    "poll_interval_minutes": self._cfg_int("poll_interval_minutes", 20),
-                    "daily_time": str(self._cfg("daily_time", "08:00")),
-                    "daily_report": self._cfg_bool("daily_report", True),
-                    "server_time": time.time(),
-                },
-            }
-        except Exception as e:
-            return {"success": False, "message": str(e)}
+        return await webui.overview(self)
 
     async def _web_history(self):
         """仪表盘历史：指定会话两个费种的日末快照序列（days 上限 60）。"""
-        try:
-            try:
-                from quart import request
-            except ImportError:
-                return {"success": False, "message": "宿主 Web 框架不可用"}
-            umo = str(request.args.get("umo", ""))
-            days = max(1, min(60, int(request.args.get("days", 14))))
-            binding = self.store.get_binding(umo) if self.store else None
-            if not binding:
-                return {"success": False, "message": "会话不存在或未绑定"}
-            tz = self._resolve_tz(self._cfg("daily_timezone", "Asia/Shanghai"))
-            series = {}
-            for kind in ("ac", "elec"):
-                history = (binding.get("history_by_fee") or {}).get(kind) or []
-                snaps = self._daily_snapshots(history, tz, days)
-                series[kind] = [
-                    {
-                        "date": str(d),
-                        "value": (float(rec["v"]) if rec else None),
-                    }
-                    for d, rec in snaps
-                ]
-            return {
-                "success": True,
-                "data": {
-                    "label": self._binding_label(binding),
-                    "days": days,
-                    "series": series,
-                },
-            }
-        except Exception as e:
-            return {"success": False, "message": str(e)}
+        return await webui.history(self)
 
     # ================= 指令：帮助与状态 =================
 
@@ -2439,29 +1946,6 @@ class DormElectricPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     # ================= 指令：自检 =================
-
-    @staticmethod
-    def _credential_state(results: dict) -> str:
-        """由一次真实查询的结果判定凭证状态（供 /电费 检查 与 /电费 状态 复用）。
-
-        判定顺序很重要：先看有没有取到余额（说明学校认这个会话），
-        再看是不是 91001（学校明确拒绝），最后才是网络/学校抖动——
-        反过来会把学校夜间故障误报成「凭证过期」，害用户白折腾一轮重新提取。
-        """
-        values = list(results.values())
-        ok = [r for r in values if r is not None and r.ok and r.value is not None]
-        expired = [r for r in values if r is not None and r.session_expired]
-        if not values:
-            return "⚠️ 绑定里没有任何费种参数，请重新 /电费 绑定"
-        if ok:
-            if expired:
-                return "⚠️ 仅部分费种可用（详见下方明细）"
-            return "✅ 有效（学校接口已接受本次查询）"
-        if expired:
-            return "⚠️ 学校已拒绝（retcode 91001 会话超时），需重新提取 JSESSIONID"
-        if all(r is None for r in values):
-            return "⚠️ 学校接口不可用（网络异常或学校无响应），凭证状态未知，请稍后 /电费 查询 重试"
-        return "⚠️ 学校有响应但未取到余额（见下方明细与 /电费 日志 的原始返回）"
 
     async def _check_report(self, umo: str) -> str:
         """自检报告全文：凭证三态 + 绑定摘要 + 实时查询 + 本会话事件尾部。
