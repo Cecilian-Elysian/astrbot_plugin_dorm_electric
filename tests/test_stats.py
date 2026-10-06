@@ -15,7 +15,7 @@ def _h(values, ages_hours, unit="度"):
     now = time.time()
     return [
         {"t": now - age * 3600, "v": v, "u": unit}
-        for age, v in zip(ages_hours, values)
+        for age, v in zip(ages_hours, values, strict=True)
     ]
 
 

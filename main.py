@@ -54,6 +54,15 @@ CODE_LENGTH = 6
 # 预警静音上限（小时）：「静音」只影响提醒推送，随时可逆，不需要验证码。
 ALERT_MUTE_MAX_HOURS = 168
 
+# 预警线 kind 参数的别名 → 内部 kind。指令（/电费 预警线 空调 15）与 AI 工具
+# （set_alert_threshold 的 kind）共用同一份，避免两处各自维护后漂移。
+THRESHOLD_KIND_MAP: dict[str, str] = {
+    "ac": "ac", "all": "all",
+    "空调": "ac", "空调费": "ac",
+    "elec": "elec", "电": "elec", "电费": "elec", "宿舍电费": "elec",
+    "宿舍电": "elec", "宿舍": "elec",
+}
+
 # 群聊是只读的：绑定/解绑会改「群」这份绑定，会影响到群里所有人。
 GROUP_WRITE_DENIED = (
     "群聊里不能绑定或解绑（会影响到群里所有人）。\n"
@@ -186,8 +195,16 @@ class DormElectricPlugin(Star):
         self._tasks.append(asyncio.create_task(self._startup_poll()))
 
     async def terminate(self):
+        # 顺序重要：先停任务再关资源。旧顺序（先关 client 后取消任务）会让
+        # 运行中的轮询在 close 的 await 间隙经 _get_client 重建一个再无人
+        # 关闭的新 client（热重载泄漏），且尾部历史改动不落盘。
         if self.scheduler:
             self.scheduler.shutdown(wait=False)
+        for t in self._tasks:
+            t.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
         if self.hjnu:
             await self.hjnu.close()
         if self.store:
@@ -195,16 +212,14 @@ class DormElectricPlugin(Star):
                 self.store.save()
             except OSError as e:
                 logger.error(f"[{PLUGIN_NAME}] 保存数据失败：{e}")
-        for t in self._tasks:
-            t.cancel()
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
-        self._tasks.clear()
         self._pending_alerts.clear()
         self._bind_tokens.clear()
         self._lookup_cache.clear()
         self._last_room.clear()
         self._alert_muted.clear()
+        self._wizard.clear()
+        self._last_raw.clear()
+        self._events.clear()
 
     # ================= 工具方法 =================
 
@@ -318,7 +333,7 @@ class DormElectricPlugin(Star):
         entries = self._fee_bindings(binding)
         keys = list(entries)
         values = await asyncio.gather(*(self._fetch_entry(entries[k]) for k in keys))
-        return dict(zip(keys, values))
+        return dict(zip(keys, values, strict=True))
 
     def _remember_raw(self, umo: str, results: dict[str, object]) -> None:
         """保存最近一次查询的原始返回，供 /电费 日志 展示（按会话隔离）。"""
@@ -474,28 +489,38 @@ class DormElectricPlugin(Star):
         keep_days = self._cfg_int("history_keep_days", 60)
         bindings = self.store.data.get("bindings", {})
         for umo, binding in list(bindings.items()):
-            results = await self._fetch_fees(binding)
-            self._remember_raw(umo, results)
-            for kind, result in results.items():
-                if result is None:
-                    continue
-                if result.ok and result.value is not None:
-                    self.store.append_fee_history(
-                        binding,
-                        kind,
-                        result.value,
-                        result.unit,
-                        keep_days=keep_days,
-                    )
-                    await self._evaluate_alerts(
-                        umo, binding, result.value, kind, result.unit
-                    )
-                elif result.session_expired:
-                    await self._notify_session_dead(umo, binding)
+            try:
+                results = await self._fetch_fees(binding)
+                self._remember_raw(umo, results)
+                for kind, result in results.items():
+                    if result is None:
+                        continue
+                    if result.ok and result.value is not None:
+                        self.store.append_fee_history(
+                            binding,
+                            kind,
+                            result.value,
+                            result.unit,
+                            keep_days=keep_days,
+                        )
+                        await self._evaluate_alerts(
+                            umo, binding, result.value, kind, result.unit
+                        )
+                    elif result.session_expired:
+                        await self._notify_session_dead(umo, binding)
+                self._record_event(
+                    umo, "poll", f"轮询：{self._binding_label(binding)}"
+                )
+            except Exception as e:
+                # 单个绑定出问题（如磁盘满导致 save 抛 OSError）只废它自己，
+                # 其余绑定照常轮询、预警照常 flush。
+                logger.error(
+                    f"[{PLUGIN_NAME}] 轮询 {umo} 失败：{e!r}", exc_info=True
+                )
+        try:
             self.store.save()
-            self._record_event(
-                umo, "poll", f"轮询：{self._binding_label(binding)}"
-            )
+        except OSError as e:
+            logger.error(f"[{PLUGIN_NAME}] 轮询后保存数据失败：{e}")
         await self._flush_alerts()
 
     def _effective_thresholds(
@@ -603,7 +628,11 @@ class DormElectricPlugin(Star):
                     }
                 )
             return
-        last_at = float(state.get("last_alert_at", {}).get(str(level), 0) or 0)
+        last_map = state.get("last_alert_at")
+        if not isinstance(last_map, dict):
+            # 脏数据防御：last_alert_at 被外写坏时按无冷却处理，别让每轮轮询都炸
+            last_map = {}
+        last_at = float(last_map.get(str(level), 0) or 0)
         need = level != prev or (now - last_at) >= cooldown
         if not need:
             return
@@ -623,11 +652,14 @@ class DormElectricPlugin(Star):
         state.setdefault("last_alert_at", {})[str(level)] = now
 
     async def _flush_alerts(self) -> None:
-        """将本轮所有 pending 预警合并为单条消息发送。"""
-        if not self._pending_alerts:
-            return
-        for umo, items in self._pending_alerts.items():
+        """将本轮所有 pending 预警合并为单条消息发送。
+
+        只清发送成功的会话：发送失败（QQ 推送瞬断等）的保留到下一轮轮询重发，
+        否则 alert_state 已记账、冷却期会把它吞掉，预警静默丢失 24 小时。
+        """
+        for umo, items in list(self._pending_alerts.items()):
             if not items:
+                self._pending_alerts.pop(umo, None)
                 continue
             binding = self.store.get_binding(umo) if self.store else None
             label = self._binding_label(binding) if binding else "未知房间"
@@ -659,13 +691,14 @@ class DormElectricPlugin(Star):
                 lines.append("建议尽快充值。")
             if not has_recovery:
                 lines.append("（说「静音 24小时」或发 /电费 静音 可暂停提醒）")
-            await self._send(umo, "\n".join(lines))
+            if not await self._send(umo, "\n".join(lines)):
+                continue
+            self._pending_alerts.pop(umo, None)
             self._record_event(
                 umo,
                 "alert",
                 f"{header}（{len(items)} 项）",
             )
-        self._pending_alerts.clear()
 
     async def _notify_session_dead(self, umo: str, binding: dict):
         state = binding.setdefault("alert_state", {})
@@ -673,14 +706,16 @@ class DormElectricPlugin(Star):
         last = float(state.get("dead_notified_at", 0) or 0)
         if now - last < 24 * 3600:
             return
-        state["dead_notified_at"] = now
-        self.store.save()
-        await self._send(
+        if not await self._send(
             umo,
             "🔐 电费查询凭证已失效，暂时无法自动查询余额。\n"
             "重新获取 JSESSIONID 后发送：/电费 凭证 JSESSIONID=xxxx\n"
             "（获取方式见 README，或联系管理员）",
-        )
+        ):
+            # 发送失败不记账：下轮轮询重试，避免被 24h 去重吞掉后彻底失声
+            return
+        state["dead_notified_at"] = now
+        self.store.save()
 
     async def _daily_all(self):
         if not self.store:
@@ -1159,11 +1194,14 @@ class DormElectricPlugin(Star):
         if not token:
             return "当前会话没有待确认的操作。"
         left = max(0, int(self._token_ttl() - (time.time() - token["at"])))
-        what = (
-            f"绑定到 {token['label']}"
-            if token["action"] == "bind"
-            else f"解绑 {token['label']}"
-        )
+        action = str(token.get("action", "bind"))
+        if action == "bind":
+            what = f"绑定到 {token['label']}"
+        elif action == "rebind":
+            prev = token.get("prev_label")
+            what = f"改绑到 {token['label']}" + (f"（原 {prev}）" if prev else "")
+        else:
+            what = f"解绑 {token['label']}"
         return (
             f"⏳ 待确认：{what}\n"
             f"验证码：{token['code']}（剩余 {left // 60} 分 {left % 60} 秒，"
@@ -1777,13 +1815,7 @@ class DormElectricPlugin(Star):
         if not self._ai_enabled():
             return "电费 AI 工具已被插件配置关闭。"
         umo = event.unified_msg_origin
-        kind_map = {
-            "ac": "ac", "all": "all",
-            "空调": "ac", "空调费": "ac",
-            "elec": "elec", "电": "elec", "电费": "elec", "宿舍电费": "elec",
-            "宿舍电": "elec", "宿舍": "elec",
-        }
-        k = kind_map.get(str(kind or "all").strip().lower(), "")
+        k = THRESHOLD_KIND_MAP.get(str(kind or "all").strip().lower(), "")
         if not k:
             return "kind 只支持 ac（空调费）/ elec（宿舍电费）/ all（两者）。"
         binding = self.store.get_binding(umo) if self.store else None
@@ -1998,12 +2030,18 @@ class DormElectricPlugin(Star):
         async def floors_of(building: dict) -> list[dict]:
             try:
                 return await self.hjnu.list_floors(aid, area, building)
+            except SessionExpiredError:
+                raise
             except QueryError:
                 return []
 
-        floors_by_building = list(
-            zip(order, await asyncio.gather(*(floors_of(b) for b in order)), strict=False)
-        )
+        try:
+            floors_by_building = list(
+                zip(order, await asyncio.gather(*(floors_of(b) for b in order)), strict=False)
+            )
+        except SessionExpiredError:
+            # 扫描途中会话过期：报「凭证过期」而不是「没找到房间」，避免误导
+            return None, CREDENTIAL_HINT
         pairs: list[tuple[dict, dict]] = []
         # 「A817」这类 token 不带楼层：从去字母后的首个非零数字猜楼层，猜中的排最前
         # （软优先，只影响扫描顺序不影响正确性；猜错就按原轮转顺序兜底）。
@@ -2078,10 +2116,15 @@ class DormElectricPlugin(Star):
                 return building, floor, await self.hjnu.list_rooms(
                     aid, area, building, floor
                 )
+            except SessionExpiredError:
+                raise
             except QueryError:
                 return building, floor, []
 
-        results = await asyncio.gather(*(rooms_of(p) for p in pairs))
+        try:
+            results = await asyncio.gather(*(rooms_of(p) for p in pairs))
+        except SessionExpiredError:
+            return None, CREDENTIAL_HINT
 
         def norm_name(room: dict) -> str:
             return re.sub(r"[^A-Za-z0-9]", "", str(room.get("room", ""))).lower()
@@ -2198,8 +2241,11 @@ class DormElectricPlugin(Star):
         if not self._ai_enabled():
             return "电费 AI 工具已被插件配置关闭。"
         umo = event.unified_msg_origin
-        token, _ = self._parse_room_hint(room_hint)
-        cache_key = f"{umo}|{token or room_hint}"
+        # 缓存键用归一化的用户原话，而不是解析出的房间 token：不同楼栋的同号
+        # 房间（春雪楼A817 / 清美楼A817）token 都是 A817，按 token 建键会让
+        # 60 秒内的第二个查询命中另一栋楼的余额。按原话建键，同房间换个说法
+        # 只是多查一次，不会错房。
+        cache_key = f"{umo}|{str(room_hint or '').strip().lower()}"
         ttl = max(0, self._cfg_int("ai_lookup_cache_seconds", 60))
         cached = self._lookup_cache.get(cache_key)
         if cached and ttl and time.time() - cached[0] < ttl:
@@ -2417,9 +2463,12 @@ class DormElectricPlugin(Star):
             return "⚠️ 学校接口不可用（网络异常或学校无响应），凭证状态未知，请稍后 /电费 查询 重试"
         return "⚠️ 学校有响应但未取到余额（见下方明细与 /电费 日志 的原始返回）"
 
-    @electric.command("检查", alias={"自检"})
     async def _check_report(self, umo: str) -> str:
-        """自检报告全文：凭证三态 + 绑定摘要 + 实时查询 + 本会话事件尾部。"""
+        """自检报告全文：凭证三态 + 绑定摘要 + 实时查询 + 本会话事件尾部。
+
+        纯函数：cmd_check 指令与 dorm_electric_check 工具共用，不要在它上面
+        挂 @electric.command——指令注册必须落在会 yield 消息的 cmd_* 上。
+        """
         binding = self.store.get_binding(umo) if self.store else None
         label = self._binding_label(binding) if binding else ""
 
@@ -2490,6 +2539,7 @@ class DormElectricPlugin(Star):
             return "电费 AI 工具已被插件配置关闭。"
         return await self._check_report(event.unified_msg_origin)
 
+    @electric.command("检查", alias={"自检"})
     async def cmd_check(self, event: AstrMessageEvent):
         """一次性自检：凭证是否生效、绑定是否正确、余额能否查到"""
         yield event.plain_result(await self._check_report(event.unified_msg_origin))
@@ -2636,13 +2686,11 @@ class DormElectricPlugin(Star):
             self._record_event(umo, "info", "恢复全局预警线")
             yield event.plain_result(f"已恢复全局默认预警线：预警 {gw:g} / 紧急 {gc:g}。")
             return
-        # 单费种前缀：「空调 20」「电 20」「ac 20」「elec 20」
+        # 单费种前缀：「空调 20」「电 20」「ac 20」「elec 20」（别名表与 AI 工具共用）
         kind = "all"
         parts = s.split()
-        kind_map = {"空调": "ac", "空调费": "ac", "ac": "ac",
-                    "电": "elec", "电费": "elec", "宿舍电费": "elec", "elec": "elec"}
-        if len(parts) == 2 and kind_map.get(parts[0].lower()):
-            kind, s = kind_map[parts[0].lower()], parts[1]
+        if len(parts) == 2 and THRESHOLD_KIND_MAP.get(parts[0].lower()):
+            kind, s = THRESHOLD_KIND_MAP[parts[0].lower()], parts[1]
         try:
             w = float(s)
         except ValueError:

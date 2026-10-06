@@ -57,6 +57,7 @@ class HjnuProvider(ElecProvider):
         referer: str,
         timeout: int,
         proxy: str = "",
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.query_path = query_path
@@ -65,6 +66,8 @@ class HjnuProvider(ElecProvider):
         self.referer = referer
         self.timeout = timeout
         self.proxy = (proxy or "").strip() or None
+        # 测试缝：注入 httpx.MockTransport 模拟学校服务器的 5xx/非 JSON/91001
+        self._transport = transport
         self._client: httpx.AsyncClient | None = None
 
     def update_cookie(self, cookie: str) -> None:
@@ -83,6 +86,7 @@ class HjnuProvider(ElecProvider):
                 timeout=self.timeout,
                 proxy=self.proxy,
                 headers=headers,
+                transport=self._transport,
             )
         return self._client
 
@@ -108,7 +112,9 @@ class HjnuProvider(ElecProvider):
                 data=fields,
                 headers=self._headers(),
             )
-        except httpx.HTTPError as e:
+        except (httpx.HTTPError, RuntimeError) as e:
+            # RuntimeError：client 在请求发出前后被并发关闭（如 terminate 竞态）。
+            # 它不是 httpx.HTTPError 子类，不接住会穿透到调用方的 gather 之外。
             hint = (
                 "请检查 http_proxy 代理节点是否可用"
                 if self.proxy
@@ -151,9 +157,10 @@ class HjnuProvider(ElecProvider):
                     break
             if attempt < 2:
                 await asyncio.sleep(1.5)
-                # 5xx/网络错误时丢弃旧连接，避免复用异常连接
-                if self._client is not None and not self._client.is_closed:
-                    await self._client.aclose()
+                # 5xx/网络错误时丢弃旧连接引用，避免复用异常连接。
+                # 不在此处 aclose：同一实例上可能有并发请求（双费种并行查询、
+                # 房间扫描）仍握着旧 client，中途关闭会让它们撞 RuntimeError；
+                # 置 None 后下一个请求经 _get_client 新建，旧实例由 GC 回收。
                 self._client = None
         raise QueryError(f"{last_err}（学校服务器暂时无响应，已自动重试仍失败，请稍后再试）")
 

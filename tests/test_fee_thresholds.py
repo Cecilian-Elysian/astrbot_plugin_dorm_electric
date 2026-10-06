@@ -10,9 +10,9 @@
 
 import asyncio
 import time
-from collections import deque
 
 from astrbot_plugin_dorm_electric.main import DormElectricPlugin
+from conftest import make_plugin
 
 UMO = "qq:private:1"
 GROUP_UMO = "qq:group:1"
@@ -50,11 +50,6 @@ class _FakeStore:
         self.saved += 1
 
 
-class _FakeConfig(dict):
-    def get(self, key, default=None):
-        return dict.get(self, key, default)
-
-
 def _binding(thresholds=None) -> dict:
     return {
         "provider": "hjnu",
@@ -64,19 +59,11 @@ def _binding(thresholds=None) -> dict:
 
 
 def _plugin(bindings=None, **cfg) -> DormElectricPlugin:
-    plugin = DormElectricPlugin.__new__(DormElectricPlugin)
-    plugin.config = _FakeConfig({"hjnu_cookie": "JSESSIONID=x"}, **cfg)
-    plugin.store = _FakeStore(bindings)
-    plugin.hjnu = None
-    plugin._wizard = {}
-    plugin._events = deque(maxlen=200)
-    plugin._last_raw = {}
-    plugin._bind_tokens = {}
-    plugin._lookup_cache = {}
-    plugin._last_room = {}
-    plugin._alert_muted = {}
-    plugin._pending_alerts = {}
-    return plugin
+    return make_plugin(
+        config={"hjnu_cookie": "JSESSIONID=x", **cfg},
+        store=_FakeStore(bindings),
+        hjnu=None,
+    )
 
 
 def _call(plugin, coro):

@@ -480,7 +480,7 @@ def _scan_snapshots(snaps: list[Path], host_filter: str, name: str) -> list[str]
             continue
         finally:
             conn.close()
-        for host, _cname, plain, encrypted in rows:
+        for host, _cname, plain, _encrypted in rows:
             if host_filter and host_filter not in host:
                 continue
             if plain:

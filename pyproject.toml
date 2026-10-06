@@ -2,9 +2,13 @@
 line-length = 100
 
 [tool.ruff.lint]
+extend-select = ["B"]  # flake8-bugbear：盯防 except 滥用、可变默认参等隐患
 ignore = [
-    "E501",  # 中文消息文本较长
+    "E501",   # 中文消息文本较长
     "BLE001", # 插件边界处有意进行宽泛异常捕获，避免单个错误拖垮插件
-    "S110",  # 同上
-    "DTZ",   # 登记时间戳使用本地时间展示
+    "S110",   # 同上
+    "DTZ",    # 登记时间戳使用本地时间展示
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

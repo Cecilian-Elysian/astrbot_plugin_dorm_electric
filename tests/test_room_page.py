@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 from astrbot_plugin_dorm_electric.main import ROOM_PAGE_SIZE, DormElectricPlugin
+from conftest import make_plugin
 
 room_page = DormElectricPlugin._room_page
 
@@ -78,7 +79,7 @@ class _FakeEvent:
 
 
 def _plugin(rooms: list[dict], room_page=0) -> DormElectricPlugin:
-    plugin = DormElectricPlugin.__new__(DormElectricPlugin)
+    plugin = make_plugin()
     plugin._wizard = {
         UMO: {
             "step": "room",
@@ -165,7 +166,7 @@ def test_unparsable_argument_explains_usage(bad):
 
 
 def test_no_rooms_yields_usage_hint():
-    plugin = DormElectricPlugin.__new__(DormElectricPlugin)
+    plugin = make_plugin()
     plugin._wizard = {UMO: {}}
     assert "先 /电费 楼层" in _call(plugin)
 

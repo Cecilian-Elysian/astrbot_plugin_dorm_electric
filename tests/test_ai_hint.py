@@ -16,6 +16,7 @@ from astrbot_plugin_dorm_electric.main import (
     AI_ELECTRIC_HINT,
     DormElectricPlugin,
 )
+from conftest import make_plugin
 
 SECRET = "JSESSIONID=SECRET"
 
@@ -33,16 +34,8 @@ class _FakeEvent:
         self.message_str = message
 
 
-class _FakeConfig(dict):
-    def get(self, key, default=None):
-        return dict.get(self, key, default)
-
-
 def _plugin(**cfg) -> DormElectricPlugin:
-    plugin = DormElectricPlugin.__new__(DormElectricPlugin)
-    plugin.config = _FakeConfig({"hjnu_cookie": SECRET}, **cfg)
-    plugin.context = None
-    return plugin
+    return make_plugin(config={"hjnu_cookie": SECRET, **cfg})
 
 
 def _call(plugin, coro):

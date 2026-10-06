@@ -5,12 +5,15 @@
 """
 
 import json
+import logging
 import os
 import time
 from pathlib import Path
 
 DEFAULT_DATA = {"bindings": {}}
 MAX_HISTORY = 5000
+
+logger = logging.getLogger(__name__)
 
 
 class Store:
@@ -24,10 +27,32 @@ class Store:
         try:
             with open(self.path, encoding="utf-8") as f:
                 data = json.load(f)
-            if isinstance(data, dict) and isinstance(data.get("bindings"), dict):
-                self.data = data
-        except (OSError, ValueError):
-            pass
+        except FileNotFoundError:
+            return  # 首次运行尚无存储文件，正常
+        except (OSError, ValueError) as e:
+            # 断电半截 JSON 等损坏也落在这里——改名保留现场再重建，
+            # 避免无声清零后无从诊断。
+            logger.error(
+                "存储文件读取失败（%s: %s）：%s", type(e).__name__, e, self.path
+            )
+            self._quarantine_corrupt()
+            return
+        if isinstance(data, dict) and isinstance(data.get("bindings"), dict):
+            self.data = data
+        else:
+            logger.error(
+                "存储文件结构异常（bindings 不是 dict），已按空数据起步：%s",
+                self.path,
+            )
+            self._quarantine_corrupt()
+
+    def _quarantine_corrupt(self) -> None:
+        """把损坏的存储文件改名保留（.corrupt-<ts>），再从头建空数据。"""
+        try:
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            self.path.rename(self.path.with_name(f"{self.path.name}.corrupt-{stamp}"))
+        except OSError as e:
+            logger.error("损坏存储文件改名失败：%s", e)
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

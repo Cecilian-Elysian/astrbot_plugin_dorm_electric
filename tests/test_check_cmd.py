@@ -11,6 +11,7 @@ from collections import deque
 import pytest
 from astrbot_plugin_dorm_electric.main import DormElectricPlugin
 from astrbot_plugin_dorm_electric.providers.base import BalanceResult
+from conftest import make_plugin
 
 UMO = "qq:12345"
 LABEL = "校本部/春雪楼2/8层/A-8-17"
@@ -96,14 +97,6 @@ class _FakeStore:
         return self._binding
 
 
-class _FakeConfig(dict):
-    def get(self, key, default=None):
-        return dict.get(self, key, default)
-
-    def save_config(self):
-        return None
-
-
 def _binding():
     ac_params = {
         "aid": "0030000000004301",
@@ -125,24 +118,24 @@ def _binding():
 
 
 def _plugin(results, cookie="JSESSIONID=abc", events=0, binding=True):
-    plugin = DormElectricPlugin.__new__(DormElectricPlugin)
-    plugin.config = _FakeConfig({"hjnu_cookie": cookie})
-    plugin.store = _FakeStore(_binding() if binding else None)
-    plugin.hjnu = _FakeProvider(results)
-    plugin._events = deque(
-        [
-            {
-                "t": time.time() - 60 * (i + 1),
-                "kind": "poll",
-                "text": f"第 {i} 次",
-                "umo": UMO,
-            }
-            for i in range(events)
-        ],
-        maxlen=200,
+    plugin = make_plugin(
+        config={"hjnu_cookie": cookie},
+        store=_FakeStore(_binding() if binding else None),
+        hjnu=_FakeProvider(results),
     )
-    plugin._last_raw = {}
-    plugin._alert_muted = {}
+    if events:
+        plugin._events = deque(
+            [
+                {
+                    "t": time.time() - 60 * (i + 1),
+                    "kind": "poll",
+                    "text": f"第 {i} 次",
+                    "umo": UMO,
+                }
+                for i in range(events)
+            ],
+            maxlen=200,
+        )
     return plugin
 
 

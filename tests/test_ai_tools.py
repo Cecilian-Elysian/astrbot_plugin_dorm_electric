@@ -10,7 +10,6 @@
 
 import asyncio
 import time
-from collections import deque
 
 import pytest
 from astrbot_plugin_dorm_electric.main import (
@@ -20,6 +19,7 @@ from astrbot_plugin_dorm_electric.main import (
     DormElectricPlugin,
 )
 from astrbot_plugin_dorm_electric.providers.base import BalanceResult
+from conftest import make_plugin
 
 UMO = "qq:private:1"
 GROUP_UMO = "qq:group:1"
@@ -127,14 +127,6 @@ class _FakeStore:
         )
 
 
-class _FakeConfig(dict):
-    def get(self, key, default=None):
-        return dict.get(self, key, default)
-
-    def save_config(self):
-        return None
-
-
 def _params(room="A-8-17"):
     return {
         "aid": AC_AID,
@@ -170,21 +162,11 @@ def _binding(room="A-8-17", history=False):
 
 
 def _plugin(bindings=None, ac=94.66, rooms=None, **cfg) -> DormElectricPlugin:
-    plugin = DormElectricPlugin.__new__(DormElectricPlugin)
-    plugin.config = _FakeConfig(
-        {"fee_items": FEE_ITEMS, "hjnu_cookie": "JSESSIONID=SECRET"}, **cfg
+    return make_plugin(
+        config={"fee_items": FEE_ITEMS, "hjnu_cookie": "JSESSIONID=SECRET", **cfg},
+        store=_FakeStore(bindings),
+        hjnu=_FakeProvider(ac=ac, rooms=rooms),
     )
-    plugin.store = _FakeStore(bindings)
-    plugin.hjnu = _FakeProvider(ac=ac, rooms=rooms)
-    plugin._wizard = {}
-    plugin._events = deque(maxlen=200)
-    plugin._last_raw = {}
-    plugin._bind_tokens = {}
-    plugin._lookup_cache = {}
-    plugin._last_room = {}
-    plugin._alert_muted = {}
-    plugin._pending_alerts = {}
-    return plugin
 
 
 def _call(plugin, coro):
@@ -1422,7 +1404,7 @@ def test_mute_tool_daily_scope():
         plugin, plugin.tool_dorm_electric_mute_alerts(event, 24, "daily")
     )
     assert "已静音每日播报 24 小时" in text
-    assert "预警" not in plugin._alert_muted  # 只关播报，预警照旧
+    assert UMO not in plugin._alert_muted  # 只关播报，预警照旧（键是 umo，别写反）
     status = _call(
         plugin, plugin.tool_dorm_electric_mute_alerts(event, 0, "daily")
     )

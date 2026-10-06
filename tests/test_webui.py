@@ -12,9 +12,9 @@ import json
 import sys
 import time
 import types
-from collections import deque
 
 from astrbot_plugin_dorm_electric.main import PLUGIN_NAME, DormElectricPlugin
+from conftest import make_plugin
 
 SECRET = "JSESSIONID=TOPSECRET"
 UMO = "qq:private:1"
@@ -40,11 +40,6 @@ class _FakeContext:
         self.registered.append((path, handler, methods, desc))
 
 
-class _FakeConfig(dict):
-    def get(self, key, default=None):
-        return dict.get(self, key, default)
-
-
 def _binding(history=False, thresholds=None) -> dict:
     b = {
         "provider": "hjnu",
@@ -67,19 +62,11 @@ def _binding(history=False, thresholds=None) -> dict:
 
 
 def _plugin(bindings=None, context=None, **cfg) -> DormElectricPlugin:
-    plugin = DormElectricPlugin.__new__(DormElectricPlugin)
-    plugin.config = _FakeConfig({"hjnu_cookie": SECRET}, **cfg)
-    plugin.store = _FakeStore(bindings)
-    plugin.context = context if context is not None else _FakeContext()
-    plugin._wizard = {}
-    plugin._events = deque(maxlen=200)
-    plugin._last_raw = {}
-    plugin._bind_tokens = {}
-    plugin._lookup_cache = {}
-    plugin._last_room = {}
-    plugin._alert_muted = {}
-    plugin._pending_alerts = {}
-    return plugin
+    return make_plugin(
+        config={"hjnu_cookie": SECRET, **cfg},
+        store=_FakeStore(bindings),
+        context=context if context is not None else _FakeContext(),
+    )
 
 
 def _call(plugin, coro):
