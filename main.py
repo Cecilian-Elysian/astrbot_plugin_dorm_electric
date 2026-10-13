@@ -183,7 +183,7 @@ def electric():
     PLUGIN_NAME,
     "Cecilian",
     "宿舍电费余额监控预警：低余额预警、每日播报、双费种同时查询、支持 AI 对话绑定与 WebUI 仪表盘",
-    "1.2.0",
+    "1.2.1",
 )
 class DormElectricPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -412,8 +412,10 @@ class DormElectricPlugin(Star):
         """记录最近一次查询的原始返回（供 /电费 日志 展示，按会话过滤）。
 
         外层带 at 时间戳：_sweep_memory 据此清理失联会话的残留。
+        值存 BalanceResult 本体（91001 判定要读 session_expired 位），
+        渲染时再取 .raw；webui 的凭证状态判定也吃这份数据。
         """
-        raw = {k: v.raw for k, v in results.items() if v is not None}
+        raw = {k: v for k, v in results.items() if v is not None}
         if raw:
             self._last_raw[umo] = {"at": time.time(), "results": raw}
 
@@ -2441,7 +2443,9 @@ class DormElectricPlugin(Star):
         raw = (self._last_raw.get(umo) or {}).get("results") or {}
         if raw:
             lines.append("\n🔍 最近一次原始返回（按费种）：")
-            for kind, txt in raw.items():
+            for kind, result in raw.items():
+                # 值是 BalanceResult（老条目可能是字符串，重启即清，做个兼容）
+                txt = getattr(result, "raw", result)
                 lines.append(f"  [{self._fee_name(kind)}] {txt}")
         else:
             lines.append("\n🔍 最近一次原始返回：（无，先发 /电费 查询 触发一次）")

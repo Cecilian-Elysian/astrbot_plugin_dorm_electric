@@ -268,3 +268,64 @@ def test_history_garbage_days_falls_back_to_default():
         assert resp["data"]["days"] == 14
     finally:
         _uninstall_quart_stub()
+
+
+# ================= 凭证状态推断（v1.2.1） =================
+
+from astrbot_plugin_dorm_electric.providers.base import BalanceResult
+from astrbot_plugin_dorm_electric.webui import credential_state
+
+
+def _res(ok=True, expired=False):
+    return BalanceResult(
+        ok=ok,
+        value=1.0 if ok else None,
+        raw="91001" if expired else "ok",
+        session_expired=expired,
+    )
+
+
+def test_credential_state_expired_when_all_sessions_rejected():
+    plugin = _plugin(bindings={UMO: _binding()})
+    plugin._last_raw[UMO] = {
+        "at": time.time(),
+        "results": {"ac": _res(expired=True)},
+    }
+    assert credential_state(plugin, {UMO: {}}) == "expired"
+
+
+def test_credential_state_ok_when_any_balance_seen():
+    """一路 91001、另一路拿到余额 → 以「学校认了」为准（夜间抖动别误报）。"""
+    plugin = _plugin(bindings={UMO: _binding()})
+    plugin._last_raw[UMO] = {
+        "at": time.time(),
+        "results": {"ac": _res(expired=True), "elec": _res(ok=True)},
+    }
+    assert credential_state(plugin, {UMO: {}}) == "ok"
+
+
+def test_credential_state_unknown_without_data():
+    plugin = _plugin(bindings={UMO: _binding(history=True)})
+    assert credential_state(plugin, {UMO: {}}) == "unknown"  # 没轮询过
+
+
+def test_credential_state_network_failure_is_not_expired():
+    """学校 5xx（ok=False 且非 91001）不能报「凭证失效」。"""
+    plugin = _plugin(bindings={UMO: _binding()})
+    plugin._last_raw[UMO] = {
+        "at": time.time(),
+        "results": {"ac": _res(ok=False, expired=False)},
+    }
+    assert credential_state(plugin, {UMO: {}}) == "unknown"
+
+
+def test_overview_exposes_credential_state():
+    plugin = _plugin(bindings={UMO: _binding(history=True)})
+    plugin._last_raw[UMO] = {
+        "at": time.time(),
+        "results": {"ac": _res(expired=True)},
+    }
+    resp = _call(plugin, plugin._web_overview())
+    assert resp["data"]["credential_state"] == "expired"
+    raw = json.dumps(resp, ensure_ascii=False)
+    assert SECRET not in raw and "JSESSIONID" not in raw

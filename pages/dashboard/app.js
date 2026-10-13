@@ -45,6 +45,15 @@ function render() {
   var d = overview;
   var binds = d.bindings || [];
 
+  // 凭证状态横幅：cookie 已配置 ≠ 学校认。expired = 有会话拿到 91001 且无一路成功
+  var banner = document.getElementById("cred-banner");
+  if (d.credential_state === "expired") {
+    banner.classList.remove("hidden");
+    banner.textContent = "🚨 学校凭证已失效（查询返回 91001）：重新获取 JSESSIONID 后私聊机器人发送「/电费 凭证 JSESSIONID=…」即可恢复，绑定与历史不会丢。";
+  } else {
+    banner.classList.add("hidden");
+  }
+
   var low = 0, alerting = 0;
   binds.forEach(function (b) {
     Object.keys(b.fees).forEach(function (k) {
@@ -54,10 +63,16 @@ function render() {
   });
   var muted = binds.filter(function (b) { return b.alert_muted_until > Date.now() / 1000; }).length;
 
+  var credState = d.credential_state || "unknown";
+  var credCard =
+    credState === "expired" ? { icon: "🔑", label: "学校凭证", value: "已失效", cls: "card-alert" }
+    : credState === "ok" ? { icon: "🔑", label: "学校凭证", value: "有效", cls: "card-success" }
+    : d.cookie_ok ? { icon: "🔑", label: "学校凭证", value: "已配置", cls: "" }
+    : { icon: "🔑", label: "学校凭证", value: "未配置", cls: "card-alert" };
   var cards = [
     { icon: "🔗", label: "绑定会话", value: binds.length, cls: "" },
     { icon: alerting > 0 ? "🚨" : "✅", label: "低于预警线的费种", value: alerting, cls: alerting > 0 ? "card-alert" : "card-success" },
-    { icon: "🔑", label: "学校凭证", value: d.cookie_ok ? "已配置" : "未配置", cls: d.cookie_ok ? "card-success" : "card-alert" },
+    credCard,
     { icon: "🔕", label: "预警静音中", value: muted, cls: muted > 0 ? "card-warn" : "" }
   ];
   document.getElementById("cards").innerHTML = cards.map(function (c) {

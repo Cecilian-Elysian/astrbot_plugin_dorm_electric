@@ -69,6 +69,32 @@ def binding_item(plugin, umo: str, binding: dict) -> dict:
     }
 
 
+def credential_state(plugin, bindings: dict) -> str:
+    """从各会话最近一次查询结果推断学校凭证状态（不发额外请求）。
+
+    - "expired"：有会话拿到 91001，且没有任何一路拿到余额 → 凭证基本确定失效
+    - "ok"：任一路拿到过余额 → 学校认了会话
+    - "unknown"：没数据（没绑定/还没轮询过/网络失败）——不能断言，别吓用户
+
+    cookie 已配置但学校不认（「已配置」≠「有效」）正是 v1.1.x 仪表盘的盲区。
+    """
+    expired = False
+    ok_seen = False
+    raw_by = getattr(plugin, "_last_raw", {}) or {}
+    for umo in bindings:
+        wrap = raw_by.get(umo) or {}
+        for result in (wrap.get("results") or {}).values():
+            if getattr(result, "session_expired", False):
+                expired = True
+            elif getattr(result, "ok", False):
+                ok_seen = True
+    if expired and not ok_seen:
+        return "expired"
+    if ok_seen:
+        return "ok"
+    return "unknown"
+
+
 async def overview(plugin) -> dict:
     """仪表盘概览：全部绑定 + 全局状态。"""
     try:
@@ -81,6 +107,7 @@ async def overview(plugin) -> dict:
                     binding_item(plugin, umo, b) for umo, b in bindings.items()
                 ],
                 "cookie_ok": bool(cookie.strip()),
+                "credential_state": credential_state(plugin, bindings),
                 "poll_interval_minutes": plugin._cfg_int("poll_interval_minutes", 20),
                 "daily_time": str(plugin._cfg("daily_time", "08:00")),
                 "daily_report": plugin._cfg_bool("daily_report", True),
