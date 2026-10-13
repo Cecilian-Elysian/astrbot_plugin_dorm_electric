@@ -48,10 +48,8 @@ try:
         LOOKUP_BUILDING_BUDGET,
         LOOKUP_ROOM_BUDGET,
         RoomResolver,
-        fuzzy_miss_text,
         last_room_line,
         parse_room_hint,
-        remember_room,
     )
     from .storage import Store
     from .thresholds import (
@@ -90,10 +88,8 @@ except ImportError:  # 兜底：被以非包方式加载时
         LOOKUP_BUILDING_BUDGET,
         LOOKUP_ROOM_BUDGET,
         RoomResolver,
-        fuzzy_miss_text,
         last_room_line,
         parse_room_hint,
-        remember_room,
     )
     from storage import Store  # type: ignore
     from thresholds import (  # type: ignore
@@ -278,11 +274,11 @@ class DormElectricPlugin(Star):
     # ================= 工具方法 =================
 
     def _cfg(self, key: str, default=None):
-        value = default
+        # config 宿主注入，理论上是 dict；防御形状异常（Mock/坏配置）不炸
         try:
             value = self.config.get(key, default)
-        except Exception:
-            pass
+        except (AttributeError, TypeError):
+            return default
         if value is None or value == "":
             return default
         return value
@@ -822,73 +818,76 @@ class DormElectricPlugin(Star):
         self._record_event(umo, "info", f"绑定向导启动，主 aid={items.get(aid, aid)}")
         return self._wizard[umo], None
 
-    async def _select_area(self, umo: str, raw) -> tuple[dict | None, str | None]:
-        """选校区并加载楼栋列表。"""
+    # 向导层级表：选了本级后去学校拉下一级列表。
+    # step → (前置键, 本级列表键, 编号标签, 用法提示, 拉取方法名,
+    #         除本级外要传的 wizard 键, 本级存键, 下一级列表键, 下一步 step, 是否重置房间页码)
+    WIZARD_LEVELS: ClassVar[dict] = {
+        "area": (
+            "aid", "areas", "校区",
+            "用法：/电费 校区 <编号>（先 /电费 绑定 启动向导）",
+            "list_buildings", ("aid",), "area", "buildings", "building", False,
+        ),
+        "building": (
+            "area", "buildings", "楼栋",
+            "用法：/电费 楼栋 <编号>（先 /电费 校区）",
+            "list_floors", ("aid", "area"), "building", "floors", "floor", False,
+        ),
+        "floor": (
+            "building", "floors", "楼层",
+            "用法：/电费 楼层 <编号>（先 /电费 楼栋）",
+            "list_rooms", ("aid", "area", "building"), "floor", "rooms", "room", True,
+        ),
+    }
+
+    async def _select_level(
+        self, umo: str, step: str, raw
+    ) -> tuple[dict | None, str | None]:
+        """向导通用选层：校验编号 → 拉下一级列表 → 写回 wizard。
+
+        三层（校区/楼栋/楼层）只有表参数不同；凭证失效统一给 CREDENTIAL_HINT，
+        学校故障给 ❌ 前缀原文。
+        """
+        (
+            prev_key, list_key, label, usage,
+            fetch_name, arg_keys, save_key, children_key, next_step, reset_page,
+        ) = self.WIZARD_LEVELS[step]
         wizard = self._wizard.get(umo) or {}
-        aid, areas = wizard.get("aid"), wizard.get("areas") or []
-        if not aid or not areas:
-            return None, "用法：/电费 校区 <编号>（先 /电费 绑定 启动向导）"
-        index, err = self._as_index(raw, len(areas), "校区编号无效")
+        items = wizard.get(list_key) or []
+        if not wizard.get(prev_key) or not items:
+            return None, usage
+        index, err = self._as_index(raw, len(items), f"{label}编号无效")
         if err:
             return None, err
-        area = areas[index - 1]
+        choice = items[index - 1]
+        args = [wizard[key] for key in arg_keys] + [choice]
         try:
-            buildings = await self.hjnu.list_buildings(aid, area)
+            children = await getattr(self.hjnu, fetch_name)(*args)
         except SessionExpiredError:
             return None, CREDENTIAL_HINT
         except QueryError as e:
             return None, f"❌ {e}"
-        wizard["area"], wizard["buildings"], wizard["step"] = area, buildings, "building"
+        wizard[save_key], wizard[children_key], wizard["step"] = (
+            choice,
+            children,
+            next_step,
+        )
+        if reset_page:
+            # 0 = 还没显示过任何页，下一次无参查看才展示第 1 页
+            wizard["room_page"] = 0
         self._wizard[umo] = wizard
         return wizard, None
+
+    async def _select_area(self, umo: str, raw) -> tuple[dict | None, str | None]:
+        """选校区并加载楼栋列表。"""
+        return await self._select_level(umo, "area", raw)
 
     async def _select_building(self, umo: str, raw) -> tuple[dict | None, str | None]:
         """选楼栋并加载楼层列表。"""
-        wizard = self._wizard.get(umo) or {}
-        buildings = wizard.get("buildings") or []
-        if not wizard.get("area") or not buildings:
-            return None, "用法：/电费 楼栋 <编号>（先 /电费 校区）"
-        index, err = self._as_index(raw, len(buildings), "楼栋编号无效")
-        if err:
-            return None, err
-        building = buildings[index - 1]
-        try:
-            floors = await self.hjnu.list_floors(wizard["aid"], wizard["area"], building)
-        except SessionExpiredError:
-            return None, CREDENTIAL_HINT
-        except QueryError as e:
-            return None, f"❌ {e}"
-        wizard["building"], wizard["floors"], wizard["step"] = (
-            building,
-            floors,
-            "floor",
-        )
-        self._wizard[umo] = wizard
-        return wizard, None
+        return await self._select_level(umo, "building", raw)
 
     async def _select_floor(self, umo: str, raw) -> tuple[dict | None, str | None]:
         """选楼层并加载该层房间列表（room_page 归零，等用户/模型第一次翻页）。"""
-        wizard = self._wizard.get(umo) or {}
-        floors = wizard.get("floors") or []
-        if not wizard.get("building") or not floors:
-            return None, "用法：/电费 楼层 <编号>（先 /电费 楼栋）"
-        index, err = self._as_index(raw, len(floors), "楼层编号无效")
-        if err:
-            return None, err
-        floor = floors[index - 1]
-        try:
-            rooms = await self.hjnu.list_rooms(
-                wizard["aid"], wizard["area"], wizard["building"], floor
-            )
-        except SessionExpiredError:
-            return None, CREDENTIAL_HINT
-        except QueryError as e:
-            return None, f"❌ {e}"
-        wizard["floor"], wizard["rooms"], wizard["step"] = floor, rooms, "room"
-        # 0 = 还没显示过任何页，下一次无参查看才展示第 1 页
-        wizard["room_page"] = 0
-        self._wizard[umo] = wizard
-        return wizard, None
+        return await self._select_level(umo, "floor", raw)
 
     def _render_areas(self, umo: str) -> str:
         wizard = self._wizard.get(umo) or {}
@@ -1155,6 +1154,14 @@ class DormElectricPlugin(Star):
             f"（{token['code']}，{token.get('label', '')}）",
         )
         return token
+
+    def _code_dm(self, first_line: str, token: dict, tail: str) -> str:
+        """确认码私聊消息模板（三处发码工具共用，文案与旧版逐字一致）。"""
+        return (
+            f"{first_line}\n"
+            f"确认码：{token['code']}（{self._token_ttl() // 60} 分钟内有效，一次性）\n"
+            f"{tail}"
+        )
 
     def _pending_view(self, umo: str) -> str:
         """未带码时的待确认项概览（只对发起它的会话可见）。"""
@@ -1425,7 +1432,8 @@ class DormElectricPlugin(Star):
             params, err = await self._resolve_room(umo, hint)
             if err:
                 return err
-            assert params
+            if not params:  # resolver 契约：(err, params) 二选一非空
+                return "房间解析失败，请换个说法（如「春雪楼2 8层 A817」）。"
             snapshot = {**params, "step": "bind"}
             label = "/".join(
                 str(params[scope].get(key, ""))
@@ -1491,10 +1499,12 @@ class DormElectricPlugin(Star):
             )
             await event.send(
                 MessageChain().message(
-                    f"🔄 待改绑：{prev_label}\n→ {label}\n"
-                    f"确认码：{token['code']}（{self._token_ttl() // 60} 分钟内有效，一次性）\n"
-                    f"确认后我会改为监控新房间（原房间的历史与预警状态清零）。"
-                    f"回复 {CODE_LENGTH} 位确认码即可。"
+                    self._code_dm(
+                        f"🔄 待改绑：{prev_label}\n→ {label}",
+                        token,
+                        f"确认后我会改为监控新房间"
+                        f"（原房间的历史与预警状态清零）。回复 {CODE_LENGTH} 位确认码即可。",
+                    )
                 )
             )
             return (
@@ -1514,9 +1524,12 @@ class DormElectricPlugin(Star):
         )
         await event.send(
             MessageChain().message(
-                f"📍 待绑定：{label}\n"
-                f"确认码：{token['code']}（{self._token_ttl() // 60} 分钟内有效，一次性）\n"
-                f"请把 {CODE_LENGTH} 位确认码原样发给我，收到后我立刻完成绑定并报当前余额。"
+                self._code_dm(
+                    f"📍 待绑定：{label}",
+                    token,
+                    f"请把 {CODE_LENGTH} 位确认码原样发给我，"
+                    "收到后我立刻完成绑定并报当前余额。",
+                )
             )
         )
         return (
@@ -1546,9 +1559,11 @@ class DormElectricPlugin(Star):
         token = self._issue_token(umo, "unbind", label=label)
         await event.send(
             MessageChain().message(
-                f"🗑️ 待解绑：{label}\n"
-                f"确认码：{token['code']}（{self._token_ttl() // 60} 分钟内有效，一次性）\n"
-                f"确认后我会停止监控这个房间。回复 {CODE_LENGTH} 位确认码即可。"
+                self._code_dm(
+                    f"🗑️ 待解绑：{label}",
+                    token,
+                    f"确认后我会停止监控这个房间。回复 {CODE_LENGTH} 位确认码即可。",
+                )
             )
         )
         return (
@@ -1748,6 +1763,31 @@ class DormElectricPlugin(Star):
         parts = [await _apply_alerts(), await _apply_daily()]
         return "\n".join(parts)
 
+    def _restore_threshold(self, umo: str, binding: dict) -> str:
+        """清除会话自定义线并落盘；返回「已恢复…」前缀（调用方补各自尾注）。"""
+        binding.pop("thresholds", None)
+        self.store.save(force=True)
+        gw, gc = self._effective_thresholds(None)
+        self._record_event(umo, "info", "恢复全局预警线")
+        return f"已恢复全局默认预警线：预警 {gw:g} / 紧急 {gc:g}"
+
+    def _apply_threshold(
+        self, umo: str, binding: dict, kind: str, w: float, c: float
+    ) -> tuple[str, float, float]:
+        """把会话预警线写入绑定并落盘（kind: ac/elec/all）。
+
+        c 非法（≤0 或 >w）自动取 w 的一半；返回 (scope, w, c) 供各入口拼文案。
+        """
+        if c <= 0 or c > w:
+            c = w / 2
+        kinds = ("ac", "elec") if kind == "all" else (kind,)
+        for one in kinds:
+            self._set_session_threshold(binding, one, w, c)
+        self.store.save(force=True)
+        scope = "空调费和宿舍电费" if kind == "all" else self._fee_name(kind)
+        self._record_event(umo, "info", f"自定义预警线 {scope} {w:g}/{c:g}")
+        return scope, w, c
+
     @filter.llm_tool(name="dorm_electric_set_alert_threshold")
     async def tool_dorm_electric_set_alert_threshold(
         self,
@@ -1796,31 +1836,13 @@ class DormElectricPlugin(Star):
         if not binding:
             return "本会话还没有绑定宿舍，无法单独设置预警线；先帮用户完成绑定。"
         if warn < 0:
-            binding.pop("thresholds", None)
-            self.store.save(force=True)
-            gw, gc = self._effective_thresholds(None)
-            self._record_event(umo, "info", "恢复全局预警线")
-            return (
-                f"已恢复全局默认预警线：预警 {gw:g} / 紧急 {gc:g}"
-                "（两费种回到全局配置）。"
-            )
+            return self._restore_threshold(umo, binding) + "（两费种回到全局配置）。"
         w = warn
         if w <= 0:
             return "预警线需要是一个正数（比如 20）。"
-        c = critical
-        if c <= 0 or c > w:
-            c = w / 2
-        kinds = ("ac", "elec") if k == "all" else (k,)
-        for one in kinds:
-            self._set_session_threshold(binding, one, w, c)
-        self.store.save(force=True)
-        scope = "空调费和宿舍电费" if k == "all" else self._fee_name(k)
+        scope, w, c = self._apply_threshold(umo, binding, k, w, critical)
         unit = "，单位分别为度、元" if k == "all" else (
             "，单位度" if k == "ac" else "，单位元"
-        )
-        self._record_event(
-            umo, "info",
-            f"自定义预警线 {scope} {w:g}/{c:g}",
         )
         return (
             f"已设置本会话预警线（{scope}{unit}）：余额 ≤ {w:g} 时提醒、"
@@ -1871,9 +1893,6 @@ class DormElectricPlugin(Star):
     LOOKUP_ROOM_BUDGET = LOOKUP_ROOM_BUDGET
     LAST_ROOM_TTL = LAST_ROOM_TTL  # 会话房间记忆 30 分钟
 
-    def _remember_room(self, umo: str, params: dict) -> None:
-        remember_room(self._last_room, umo, params)
-
     def _last_room_line(self, umo: str) -> str:
         return last_room_line(self._last_room, umo)
 
@@ -1892,16 +1911,12 @@ class DormElectricPlugin(Star):
     async def _resolve_room(self, umo: str, hint: str) -> tuple[dict | None, str | None]:
         return await self._resolver().resolve(umo, hint)
 
-    @staticmethod
-    def _fuzzy_miss_text(token: str, scanned: list[tuple[str, dict, dict, dict]]) -> str:
-        return fuzzy_miss_text(token, scanned)
-
-
     async def _query_room_balance(self, umo: str, hint: str) -> str:
         params, err = await self._resolve_room(umo, hint)
         if err:
             return err
-        assert params
+        if not params:  # resolver 契约：(err, params) 二选一非空
+            return "房间解析失败，请换个说法（如「春雪楼817 电费多少」）。"
         label = (
             f"{params['area'].get('areaname')}/{params['building'].get('building')}/"
             f"{params['floor'].get('floor')}/{params['room'].get('room')}"
@@ -2275,11 +2290,7 @@ class DormElectricPlugin(Star):
             if not binding:
                 yield event.plain_result("当前会话没有绑定。")
                 return
-            binding.pop("thresholds", None)
-            self.store.save(force=True)
-            gw, gc = self._effective_thresholds(None)
-            self._record_event(umo, "info", "恢复全局预警线")
-            yield event.plain_result(f"已恢复全局默认预警线：预警 {gw:g} / 紧急 {gc:g}。")
+            yield event.plain_result(self._restore_threshold(umo, binding) + "。")
             return
         # 单费种前缀：「空调 20」「电 20」「ac 20」「elec 20」（别名表与 AI 工具共用）
         kind = "all"
@@ -2297,13 +2308,7 @@ class DormElectricPlugin(Star):
         if not binding:
             yield event.plain_result("本会话还没有绑定宿舍，先 /电费 绑定。")
             return
-        c = w / 2
-        kinds = ("ac", "elec") if kind == "all" else (kind,)
-        for one in kinds:
-            self._set_session_threshold(binding, one, w, c)
-        self.store.save(force=True)
-        scope = "空调费和宿舍电费" if kind == "all" else self._fee_name(kind)
-        self._record_event(umo, "info", f"自定义预警线 {scope} {w:g}/{c:g}")
+        scope, w, c = self._apply_threshold(umo, binding, kind, w, 0.0)
         yield event.plain_result(
             f"已设置本会话预警线（{scope}）：余额 ≤ {w:g} 时提醒、≤ {c:g} 时紧急提醒。\n"
             "下一个轮询周期开始按新线判断；/电费 预警线 取消 可还原。"
