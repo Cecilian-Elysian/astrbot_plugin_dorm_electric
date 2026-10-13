@@ -1,4 +1,4 @@
-﻿"""宿舍电费余额监控预警插件。
+"""宿舍电费余额监控预警插件。
 
 - /电费 指令组：绑定宿舍向导、查询、状态、凭证、历史、日志、自检、确认验证码
 - 定时轮询余额 → 低余额/紧急预警（含冷却，分费种独立预警线），预警按会话合并
@@ -262,9 +262,10 @@ class DormElectricPlugin(Star):
             await self.hjnu.close()
         if self.store:
             try:
-                self.store.save()
+                # force=True：save() 有 60 秒去抖，退出时必须把攒下的采样点落盘
+                self.store.save(force=True)
             except OSError as e:
-                logger.error(f"[{PLUGIN_NAME}] 保存数据失败：{e}")
+                logger.error(f"[{PLUGIN_NAME}] 退出保存失败：{e}")
         self._pending_alerts.clear()
         self._bind_tokens.clear()
         self._lookup_cache.clear()
@@ -1008,7 +1009,7 @@ class DormElectricPlugin(Star):
 
     def _unbind(self, umo: str) -> str:
         if self.store and self.store.del_binding(umo):
-            self.store.save()
+            self.store.save(force=True)
             self._wizard.pop(umo, None)
             self._last_raw.pop(umo, None)
             # 队列里还压着这一轮的预警/恢复通知，不清的话解绑之后
@@ -1066,7 +1067,7 @@ class DormElectricPlugin(Star):
             f"预警线：{self._cfg_float('threshold_warn', 10):g}；"
             f"紧急线：{self._cfg_float('threshold_critical', 5):g}。轮询与预警已启用。"
         )
-        self.store.save()
+        self.store.save(force=True)
         self._record_event(
             umo,
             "info",
@@ -1681,13 +1682,13 @@ class DormElectricPlugin(Star):
             if hours > 0:
                 span = max(1.0, min(float(hours), float(ALERT_MUTE_MAX_HOURS)))
                 binding["daily_muted_until"] = time.time() + span * 3600
-                self.store.save()
+                self.store.save(force=True)
                 self._record_event(umo, "info", f"每日播报静音 {span:g} 小时")
                 when = datetime.fromtimestamp(binding["daily_muted_until"], tz)
                 return f"🔕 已静音每日播报 {span:g} 小时（至 {when:%m-%d %H:%M}），预警照常。"
             if hours < 0:
                 binding.pop("daily_muted_until", None)
-                self.store.save()
+                self.store.save(force=True)
                 self._record_event(umo, "info", "恢复每日播报")
                 return "🔔 已恢复每日播报。"
             if until > time.time():
@@ -1751,7 +1752,7 @@ class DormElectricPlugin(Star):
             return "本会话还没有绑定宿舍，无法单独设置预警线；先帮用户完成绑定。"
         if warn < 0:
             binding.pop("thresholds", None)
-            self.store.save()
+            self.store.save(force=True)
             gw, gc = self._effective_thresholds(None)
             self._record_event(umo, "info", "恢复全局预警线")
             return (
@@ -1767,7 +1768,7 @@ class DormElectricPlugin(Star):
         kinds = ("ac", "elec") if k == "all" else (k,)
         for one in kinds:
             self._set_session_threshold(binding, one, w, c)
-        self.store.save()
+        self.store.save(force=True)
         scope = "空调费和宿舍电费" if k == "all" else self._fee_name(k)
         unit = "，单位分别为度、元" if k == "all" else (
             "，单位度" if k == "ac" else "，单位元"
@@ -2230,7 +2231,7 @@ class DormElectricPlugin(Star):
                 yield event.plain_result("当前会话没有绑定。")
                 return
             binding.pop("thresholds", None)
-            self.store.save()
+            self.store.save(force=True)
             gw, gc = self._effective_thresholds(None)
             self._record_event(umo, "info", "恢复全局预警线")
             yield event.plain_result(f"已恢复全局默认预警线：预警 {gw:g} / 紧急 {gc:g}。")
@@ -2255,7 +2256,7 @@ class DormElectricPlugin(Star):
         kinds = ("ac", "elec") if kind == "all" else (kind,)
         for one in kinds:
             self._set_session_threshold(binding, one, w, c)
-        self.store.save()
+        self.store.save(force=True)
         scope = "空调费和宿舍电费" if kind == "all" else self._fee_name(kind)
         self._record_event(umo, "info", f"自定义预警线 {scope} {w:g}/{c:g}")
         yield event.plain_result(
@@ -2290,7 +2291,7 @@ class DormElectricPlugin(Star):
             )
             self._record_event(umo, "error", "查询失败：网络异常")
             return
-        self.store.save()
+        self.store.save(force=True)
         self._record_event(
             umo,
             "query",

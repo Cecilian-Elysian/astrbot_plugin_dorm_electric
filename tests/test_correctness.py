@@ -99,7 +99,7 @@ class _FakeStore:
     def del_binding(self, umo):
         return self.data["bindings"].pop(umo, None) is not None
 
-    def save(self):
+    def save(self, force=False):
         self.saved += 1
 
     @staticmethod

@@ -24,6 +24,15 @@ class SessionExpiredError(QueryError):
     """会话凭证失效（retcode 91001）。"""
 
 
+async def _safe_aclose(client: httpx.AsyncClient) -> None:
+    """关连接尽力而为：terminate 竞态下 aclose 可能抛，别让它盖掉真实异常。"""
+    try:
+        if not client.is_closed:
+            await client.aclose()
+    except Exception as e:  # 收尾路径不该再抛，盖掉真实异常就难查了
+        logger.debug("关闭 httpx client 失败：%r", e)
+
+
 # 例：A-8-17房间当前剩余电量94.66度
 BALANCE_RE = re.compile(
     r"(?:剩余电量\s*([0-9]+(?:\.[0-9]+)?)\s*度|余额\s*[：:]\s*([0-9]+(?:\.[0-9]+)?)\s*元)"
@@ -47,6 +56,10 @@ def parse_balance(raw_msg: str) -> tuple[float, str, str] | None:
 
 class HjnuProvider(ElecProvider):
     name = "hjnu"
+    # 退休连接池上限：重试换连接时不能当场 aclose（双费种并行查询、房间扫描
+    # 可能还握着旧 client，中途关闭会让它们撞 RuntimeError），先攒着，
+    # 攒够了再关最老的，最后 close() 兜底全关。
+    retired_limit = 4
 
     def __init__(
         self,
@@ -69,6 +82,7 @@ class HjnuProvider(ElecProvider):
         # 测试缝：注入 httpx.MockTransport 模拟学校服务器的 5xx/非 JSON/91001
         self._transport = transport
         self._client: httpx.AsyncClient | None = None
+        self._retired: list[httpx.AsyncClient] = []
 
     def update_cookie(self, cookie: str) -> None:
         self.cookie = (cookie or "").strip()
@@ -90,9 +104,21 @@ class HjnuProvider(ElecProvider):
             )
         return self._client
 
+    async def _retire_client(self) -> None:
+        """把异常连接移出共享池，等在途请求跑完再关（见 retired_limit 注释）。"""
+        client, self._client = self._client, None
+        if client is None or client.is_closed:
+            return
+        self._retired.append(client)
+        while len(self._retired) > self.retired_limit:
+            await _safe_aclose(self._retired.pop(0))
+
     async def close(self) -> None:
-        if self._client is not None and not self._client.is_closed:
-            await self._client.aclose()
+        clients = [c for c in [self._client, *self._retired] if c is not None]
+        self._client = None
+        self._retired.clear()
+        for client in clients:
+            await _safe_aclose(client)
 
     def _headers(self) -> dict:
         if not self.cookie:
@@ -158,10 +184,10 @@ class HjnuProvider(ElecProvider):
             if attempt < 2:
                 await asyncio.sleep(1.5)
                 # 5xx/网络错误时丢弃旧连接引用，避免复用异常连接。
-                # 不在此处 aclose：同一实例上可能有并发请求（双费种并行查询、
-                # 房间扫描）仍握着旧 client，中途关闭会让它们撞 RuntimeError；
-                # 置 None 后下一个请求经 _get_client 新建，旧实例由 GC 回收。
-                self._client = None
+                # 不在此处直接 aclose：同一实例上可能有并发请求（双费种并行查询、
+                # 房间扫描）仍握着旧 client；交给 _retire_client 攒够再关、
+                # terminate 时 close() 兜底全关。
+                await self._retire_client()
         raise QueryError(f"{last_err}（学校服务器暂时无响应，已自动重试仍失败，请稍后再试）")
 
     @staticmethod

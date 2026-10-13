@@ -76,3 +76,74 @@ def test_load_corrupt_file(tmp_path):
     p.write_text("{not json", encoding="utf-8")
     s = Store(p)
     assert s.data == {"bindings": {}}
+
+
+def test_save_debounces_within_window(tmp_path, monkeypatch):
+    p = tmp_path / "h.json"
+    s = Store(p)
+    clock = [1000.0]
+
+    def fake_time():
+        return clock[0]
+
+    monkeypatch.setattr(time, "time", fake_time)
+    s.data["bindings"]["u"] = {"room_label": "v1"}
+    s.save()  # 首次（_last_saved_at=0）必然落盘
+    assert p.exists()
+    mtime1 = p.read_text(encoding="utf-8")
+    s.data["bindings"]["u"] = {"room_label": "v2"}
+    clock[0] += 5  # 窗口内
+    s.save()
+    assert p.read_text(encoding="utf-8") == mtime1  # 没写
+    assert s._dirty is True
+    clock[0] += 120  # 窗口外
+    s.save()
+    assert "v2" in p.read_text(encoding="utf-8")
+    assert s._dirty is False
+
+
+def test_save_force_bypasses_debounce(tmp_path, monkeypatch):
+    p = tmp_path / "h.json"
+    s = Store(p)
+    clock = [1000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    s.data["bindings"]["u"] = {"room_label": "v1"}
+    s.save()
+    s.data["bindings"]["u"] = {"room_label": "v2"}
+    clock[0] += 1  # 窗口内
+    s.save(force=True)  # 用户动作必须立即持久化
+    assert "v2" in p.read_text(encoding="utf-8")
+    assert s._dirty is False
+
+
+def test_flush_writes_pending_changes(tmp_path, monkeypatch):
+    p = tmp_path / "h.json"
+    s = Store(p)
+    clock = [1000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    assert s.flush() is False  # 没东西可写
+    s.data["bindings"]["u"] = {"room_label": "v"}
+    s.save()
+    s.data["bindings"]["u"] = {"room_label": "v2"}
+    clock[0] += 1
+    s.save()  # 被去抖
+    assert s.flush() is True
+    assert "v2" in p.read_text(encoding="utf-8")
+    assert s.flush() is False
+
+
+def test_save_atomic_no_tmp_leftover(tmp_path):
+    p = tmp_path / "h.json"
+    s = Store(p)
+    s.data["bindings"]["u"] = {"room_label": "v"}
+    s.save(force=True)
+    assert not (tmp_path / "h.tmp").exists()
+    assert p.exists()
+
+
+def test_load_quarantine_renames_corrupt_file(tmp_path):
+    p = tmp_path / "h.json"
+    p.write_text("{not json", encoding="utf-8")
+    Store(p)
+    renamed = list(tmp_path.glob("h.json.corrupt-*"))
+    assert len(renamed) == 1

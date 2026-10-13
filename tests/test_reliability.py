@@ -255,7 +255,7 @@ class _MultiBindingStore:
 
         Store.append_fee_history(*a, **k)
 
-    def save(self):
+    def save(self, force=False):
         self.saved += 1
 
 
@@ -287,7 +287,7 @@ def test_poll_isolates_failing_binding(monkeypatch):
 
 def test_poll_save_failure_still_flushes_and_does_not_raise(monkeypatch):
     class _BrokenStore(_MultiBindingStore):
-        def save(self):
+        def save(self, force=False):
             raise OSError("disk full")
 
     plugin = make_plugin(
@@ -315,7 +315,7 @@ def test_terminate_cancels_tasks_before_closing_resources():
     from astrbot_plugin_dorm_electric.storage import Store
 
     class _TmpStore(Store):
-        def save(self):
+        def save(self, force=False):
             order.append("save")
 
     import tempfile
@@ -365,3 +365,57 @@ def test_terminate_cancels_tasks_before_closing_resources():
 def test_terminate_tolerates_missing_resources():
     plugin = make_plugin()  # store/hjnu/scheduler 全 None，不应抛
     asyncio.run(plugin.terminate())
+
+
+# ================= 退休连接：不中途 close、上限收敛、close() 全关 =================
+
+
+def test_5xx_retires_client_without_midflight_close(monkeypatch):
+    provider, _calls = _provider(
+        [(502, ""), (200, json.dumps(OK_BALANCE))], monkeypatch
+    )
+    asyncio.run(provider.query_room(ROOM_PARAMS))
+    assert len(provider._retired) == 1  # 旧连接进退休池
+    assert provider._client is not None  # 新连接已建
+    assert provider._client not in provider._retired
+    asyncio.run(provider.close())
+    assert provider._retired == []
+    assert provider._client is None
+
+
+def test_retired_pool_is_bounded(monkeypatch):
+    provider, _calls = _provider(
+        [(502, ""), (502, ""), (502, ""), (502, ""), (502, ""), (502, "")],
+        monkeypatch,
+    )
+    with pytest.raises(QueryError):
+        asyncio.run(provider.list_areas("a1"))
+    # 3 次重试 → 最多退 2 个旧连接，远小于 retired_limit
+    assert len(provider._retired) <= provider.retired_limit
+    asyncio.run(provider.close())
+    for client in provider._retired:
+        assert client.is_closed
+
+
+def test_close_closes_current_and_retired_clients(monkeypatch):
+    provider, _calls = _provider(
+        [(502, ""), (200, json.dumps(OK_BALANCE))], monkeypatch
+    )
+    asyncio.run(provider.query_room(ROOM_PARAMS))
+    old_retired = list(provider._retired)
+    asyncio.run(provider.close())
+    assert all(c.is_closed for c in old_retired)
+
+
+def test_safe_aclose_tolerates_closed_and_broken(monkeypatch):
+    provider, _calls = _provider([(200, json.dumps(OK_BALANCE))], monkeypatch)
+
+    class _Boom:
+        is_closed = False
+
+        async def aclose(self):
+            raise RuntimeError("already closing")
+
+    asyncio.run(http_json._safe_aclose(_Boom()))  # 不抛
+    asyncio.run(http_json._safe_aclose(provider._get_client()))  # 正常关
+    assert provider._client.is_closed

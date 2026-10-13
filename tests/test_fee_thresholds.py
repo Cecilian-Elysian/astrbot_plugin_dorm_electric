@@ -46,7 +46,7 @@ class _FakeStore:
     def set_binding(self, umo, binding):
         self.data["bindings"][umo] = binding
 
-    def save(self):
+    def save(self, force=False):
         self.saved += 1
 
 
