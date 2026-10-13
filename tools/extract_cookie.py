@@ -899,6 +899,38 @@ def _ask_bot_field(value: str, label: str, env_name: str, example: str) -> str:
         return ""
 
 
+def _ask_password(user: str) -> str:
+    """取机器人密码：环境变量优先，否则交互输入。
+
+    三个坑都在这里处理掉：
+    - getpass 不回显，对第一次用的人像「输不进去」→ 提前打一行说明；
+    - 部分终端下 getpass 读不到控制台（EOF/报错/空串）→ 自动降级成可见输入；
+    - 两次都空 → 不拿空密码去登录，直接给出 setx 提示。
+    """
+    from_env = os.environ.get("ASTRBOT_PASS")
+    if from_env:
+        return from_env
+    print(f"  AstrBot({user}) 密码")
+    print("  （输入时屏幕上不会出现任何字符，这是正常的；打完直接按回车）")
+    value = ""
+    try:
+        value = getpass.getpass("  密码: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return ""
+    except Exception:
+        value = ""
+    if value:
+        return value
+    print("  没读到内容（这个终端可能不支持无回显输入），这次会显示字符：")
+    try:
+        value = input("  密码: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return ""
+    if value:
+        print("  提示：密码这次显示在屏幕上，可用 setx ASTRBOT_PASS 免除这一步。")
+    return value
+
+
 def _push_and_report(args: argparse.Namespace, value: str) -> int:
     """登录机器人 → 新会话 → 发 /电费 凭证，按回复分类给出结论。"""
     base = _ask_bot_field(
@@ -934,9 +966,14 @@ def _push_and_report(args: argparse.Namespace, value: str) -> int:
             )
         return 3
     print("④ 推送给机器人并验证…")
-    password = os.environ.get("ASTRBOT_PASS") or getpass.getpass(
-        f"AstrBot({user}) 密码: "
-    )
+    password = _ask_password(user)
+    if not password:
+        print("✗ 没拿到密码，已跳过推送。", file=sys.stderr)
+        print(
+            "  可用 setx ASTRBOT_PASS \"你的密码\" 设一次，或重新运行本脚本再输入。",
+            file=sys.stderr,
+        )
+        return 3
     try:
         token = bot_login(base, user, password)
         session_id = bot_new_session(base, token)

@@ -141,6 +141,60 @@ def test_push_never_calls_bot_when_user_gives_up(monkeypatch):
     assert ec._push_and_report(_push_args(), "v") == 3
 
 
+# ---------------- 密码输入 ----------------
+
+
+def test_password_prefers_env(monkeypatch):
+    monkeypatch.setattr(ec.os, "environ", {"ASTRBOT_PASS": "from-env"})
+    monkeypatch.setattr(ec.getpass, "getpass", lambda *a: pytest.fail("不该追问"))
+    assert ec._ask_password("qxm") == "from-env"
+
+
+def test_password_hidden_input_is_accepted(monkeypatch, capsys):
+    monkeypatch.setattr(ec.os, "environ", {})
+    monkeypatch.setattr(ec.getpass, "getpass", lambda *a: "  typed  ")
+    assert ec._ask_password("qxm") == "typed"
+    assert "不会出现任何字符" in capsys.readouterr().out
+
+
+def test_password_falls_back_to_visible_when_getpass_empty(monkeypatch, capsys):
+    monkeypatch.setattr(ec.os, "environ", {})
+    monkeypatch.setattr(ec.getpass, "getpass", lambda *a: "")
+    monkeypatch.setattr("builtins.input", lambda *a: "typed-visible")
+    assert ec._ask_password("qxm") == "typed-visible"
+    assert "setx ASTRBOT_PASS" in capsys.readouterr().out
+
+
+def test_password_falls_back_when_getpass_raises(monkeypatch):
+    monkeypatch.setattr(ec.os, "environ", {})
+
+    def _boom(*a):
+        raise OSError("no console")
+
+    monkeypatch.setattr(ec.getpass, "getpass", _boom)
+    monkeypatch.setattr("builtins.input", lambda *a: "typed-after-error")
+    assert ec._ask_password("qxm") == "typed-after-error"
+
+
+def test_password_aborts_on_eof(monkeypatch, capsys):
+    monkeypatch.setattr(ec.os, "environ", {})
+
+    def _eof(*a):
+        raise EOFError
+
+    monkeypatch.setattr(ec.getpass, "getpass", _eof)
+    assert ec._ask_password("qxm") == ""
+
+
+def test_push_skips_when_password_missing(monkeypatch, capsys):
+    monkeypatch.setattr(ec, "_ask_bot_field", lambda v, *a: v or "http://x:6185")
+    monkeypatch.setattr(ec, "_ask_password", lambda user: "")
+    monkeypatch.setattr(ec, "bot_login", lambda *a: pytest.fail("不该用空密码登录"))
+    args = _push_args(bot_url="http://x:6185", bot_user="qxm")
+    assert ec._push_and_report(args, "v") == 3
+    assert "ASTRBOT_PASS" in capsys.readouterr().err
+
+
 # ---------------- 依赖预检 ----------------
 
 
