@@ -19,11 +19,21 @@ def effective_thresholds(
     > 全局旧配置（threshold_warn/critical，两费种共用，老用户零感知）。
     会话存储兼容两代格式：新 {"ac": {warn, critical}, "elec": {…}} 只存
     自定义过的费种；旧 {"warn":…, "critical":…} 视为两费种共用。
+
+    per-fee 回退链与配置提示一一对应：
+      设了 per-fee 紧急线        → 用它
+      只设了 per-fee 预警线      → 紧急线 = 预警线一半
+      都没设（走通用配置）        → 用通用紧急线（老配置行为不变）
     """
-    warn = cfg_float(f"threshold_warn_{kind}", 0) or cfg_float("threshold_warn", 10)
-    critical = cfg_float(f"threshold_critical_{kind}", 0) or cfg_float(
-        "threshold_critical", 5
-    )
+    per_fee_warn = cfg_float(f"threshold_warn_{kind}", 0)
+    per_fee_critical = cfg_float(f"threshold_critical_{kind}", 0)
+    warn = per_fee_warn or cfg_float("threshold_warn", 10)
+    if per_fee_critical > 0:
+        critical = per_fee_critical
+    elif per_fee_warn > 0:
+        critical = per_fee_warn / 2
+    else:
+        critical = cfg_float("threshold_critical", 5)
     if critical > warn:
         warn, critical = critical, warn
     t = (binding or {}).get("thresholds") or {}

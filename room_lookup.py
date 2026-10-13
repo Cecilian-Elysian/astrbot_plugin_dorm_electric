@@ -277,13 +277,23 @@ class RoomResolver:
         bound_name = (bound or {}).get("params", {}).get("building", {}).get("building")
         order = order_buildings(buildings, text, bound_name)
 
+        # 扫描期间学校 5xx/超时会被降级成「这栋楼没楼层」，若不记账，最后就会
+        # 报成「没有 8 层 / 没找到房间」——把网络故障说成用户房间不存在。
+        # 所以逐次记账：全部失败时报「学校接口异常」，部分失败则照常报没找到。
+        floors_ok = 0
+        floors_err: list[str] = []
+
         async def floors_of(building: dict) -> list[dict]:
+            nonlocal floors_ok
             try:
-                return await self._hjnu.list_floors(aid, area, building)
+                out = await self._hjnu.list_floors(aid, area, building)
             except SessionExpiredError:
                 raise
-            except QueryError:
+            except QueryError as e:
+                floors_err.append(f"{building.get('building')}：{e}")
                 return []
+            floors_ok += 1
+            return out
 
         try:
             floors_by_building = list(
@@ -292,6 +302,11 @@ class RoomResolver:
         except SessionExpiredError:
             # 扫描途中会话过期：报「凭证过期」而不是「没找到房间」，避免误导
             return None, CREDENTIAL_HINT
+        if not floors_ok and floors_err:
+            return None, (
+                f"❌ 学校接口异常（{floors_err[0]}），这次一个楼层都没扫到，"
+                "「没找到」不作数，请稍后重试。"
+            )
         # 「A817」这类 token 不带楼层：从去字母后的首个非零数字猜楼层，猜中的排最前
         # （软优先，只影响扫描顺序不影响正确性；猜错就按原轮转顺序兜底）。
         guess = "" if floor_no else guess_floor_no(token)
@@ -316,21 +331,33 @@ class RoomResolver:
                 "例如「春雪楼2 8层 A817」。"
             )
 
+        rooms_ok = 0
+        rooms_err: list[str] = []
+
         async def rooms_of(pair: tuple[dict, dict]) -> tuple[dict, dict, list[dict]]:
+            nonlocal rooms_ok
             building, floor = pair
             try:
-                return building, floor, await self._hjnu.list_rooms(
-                    aid, area, building, floor
-                )
+                out = await self._hjnu.list_rooms(aid, area, building, floor)
             except SessionExpiredError:
                 raise
-            except QueryError:
+            except QueryError as e:
+                rooms_err.append(
+                    f"{building.get('building')}/{floor.get('floor')}：{e}"
+                )
                 return building, floor, []
+            rooms_ok += 1
+            return building, floor, out
 
         try:
             results = await asyncio.gather(*(rooms_of(p) for p in pairs))
         except SessionExpiredError:
             return None, CREDENTIAL_HINT
+        if not rooms_ok and rooms_err:
+            return None, (
+                f"❌ 学校接口异常（{rooms_err[0]}），这次房间列表都没拉到，"
+                "「没找到」不作数，请稍后重试。"
+            )
 
         hits = strict_match(results, token)
         if not hits:

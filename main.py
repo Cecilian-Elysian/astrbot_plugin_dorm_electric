@@ -337,16 +337,31 @@ class DormElectricPlugin(Star):
     def _resolve_tz(name: str) -> timezone:
         """解析时区配置为标准库 timezone 对象，零外部依赖。
 
-        当前仅识别 Asia/Shanghai（CST，UTC+8）。其他字符串回退为 UTC。
+        认得 Asia/Shanghai / Asia/Beijing / PRC / UTC+8 / +08:00 这一类 UTC+8 写法
+        （用户手填 config 时最容易写成 Asia/Beijing 或 PRC，静默回退 UTC 会让
+        每日播报和 /电费 日志的时间整整差 8 小时）。
         """
         n = str(name or "").strip()
-        if "Shanghai" in n or n in ("CST", "CST-8", "+08", "+08:00"):
+        if not n:
+            return timezone(timedelta(hours=8))
+        if (
+            "Shanghai" in n
+            or "Beijing" in n
+            or n.upper() in ("CST", "PRC", "UTC+8", "GMT+8", "UTC8", "GMT8")
+            or n in ("+08", "+08:00", "8", "0800")
+        ):
             return timezone(timedelta(hours=8))
         try:
             offset = int(n)
-            return timezone(timedelta(hours=offset))
         except ValueError:
-            return timezone.utc
+            offset = 0
+        if -12 <= offset <= 14:
+            return timezone(timedelta(hours=offset))
+        logger.warning(
+            f"[{PLUGIN_NAME}] 认不出时区 {name!r}，回退 UTC；"
+            "建议填 Asia/Shanghai（每日播报与日志时间会按它显示）"
+        )
+        return timezone.utc
 
     def _binding_label(self, binding: dict) -> str:
         return binding.get("room_label") or binding.get("params", {}).get("room", {}).get(
@@ -473,6 +488,11 @@ class DormElectricPlugin(Star):
                 "aid": elec_aid, "area": area, "building": building,
                 "floor": floor, "room": room,
             })
+        except SessionExpiredError:
+            # SessionExpiredError 是 QueryError 的子类：不单独放行的话，凭证过期
+            # 会被降级成「未自动关联宿舍电费（请检查 room token…）」，
+            # 把凭证问题甩锅给用户的房间号。
+            raise
         except QueryError as e:
             logger.warning(f"[{PLUGIN_NAME}] 自动匹配宿舍电费房间失败：{e}")
             return None
@@ -620,7 +640,12 @@ class DormElectricPlugin(Star):
                 self._pending_alerts.pop(umo, None)
                 continue
             binding = self.store.get_binding(umo) if self.store else None
-            label = self._binding_label(binding) if binding else "未知房间"
+            if binding is None:
+                # 已解绑/绑定被删：这条预警已经没有收件人了，丢掉而不是
+                # 发一条「⚠️ 余额预警 | 未知房间」。
+                self._pending_alerts.pop(umo, None)
+                continue
+            label = self._binding_label(binding)
             has_critical = any(i["level"] == 2 for i in items)
             has_recovery = all(i["level"] == 0 for i in items)
             if has_critical:
@@ -682,17 +707,24 @@ class DormElectricPlugin(Star):
         today = datetime.now(tz).date().isoformat()
         bindings = self.store.data.get("bindings", {})
         for umo, binding in list(bindings.items()):
-            if self._daily_muted_until(binding) > time.time():
-                continue
-            if binding.get("last_daily_date") == today:
-                continue
-            text = self._daily_text(binding)
-            if not text:
-                continue
-            if await self._send(umo, text):
-                binding["last_daily_date"] = today
-                self.store.save()
-                self._record_event(umo, "info", f"每日播报已发送：{self._binding_label(binding)}")
+            try:
+                if self._daily_muted_until(binding) > time.time():
+                    continue
+                if binding.get("last_daily_date") == today:
+                    continue
+                text = self._daily_text(binding)
+                if not text:
+                    continue
+                if await self._send(umo, text):
+                    binding["last_daily_date"] = today
+                    self.store.save()
+                    self._record_event(umo, "info", f"每日播报已发送：{self._binding_label(binding)}")
+            except Exception as e:
+                # 单个绑定数据损坏（history 里少字段等）只废它自己，
+                # 不然后面所有会话当天的播报都被连累（对齐 _poll_all 的处理）。
+                logger.error(
+                    f"[{PLUGIN_NAME}] 每日播报 {umo} 失败：{e!r}", exc_info=True
+                )
 
     def _daily_text(self, binding: dict) -> str | None:
         label = self._binding_label(binding)
@@ -979,6 +1011,9 @@ class DormElectricPlugin(Star):
             self.store.save()
             self._wizard.pop(umo, None)
             self._last_raw.pop(umo, None)
+            # 队列里还压着这一轮的预警/恢复通知，不清的话解绑之后
+            # 还会收到一条「⚠️ 余额预警 | 未知房间」。
+            self._pending_alerts.pop(umo, None)
             return "✅ 已解绑并停止监控。\n要再绑定，直接说房间号即可，例如「春雪楼817」。"
         return "当前会话没有绑定。"
 
@@ -1001,7 +1036,12 @@ class DormElectricPlugin(Star):
             "room": room,
         }
         fees = {"ac": self._fee_entry(ac_params)}
-        elec = await self._match_elec_fee(ac_params)
+        elec_expired = False
+        try:
+            elec = await self._match_elec_fee(ac_params)
+        except SessionExpiredError:
+            # 扫描途中凭证过期：不跟着说「room token 有问题」，如实报凭证
+            elec, elec_expired = None, True
         if elec:
             fees["elec"] = elec
         binding = {
@@ -1015,11 +1055,12 @@ class DormElectricPlugin(Star):
         self.store.set_binding(umo, binding)
         fee_lines, _ = await self._query_and_record(umo, binding)
         lines = [f"✅ 绑定成功：{label}"]
-        lines.append(
-            "已自动关联宿舍电费房间"
-            if "elec" in fees
-            else "⚠️ 未自动关联宿舍电费（请检查 room token 是否在电费 aid 下也存在）"
-        )
+        if "elec" in fees:
+            lines.append("已自动关联宿舍电费房间")
+        elif elec_expired:
+            lines.append("⚠️ 查询时凭证失效，暂未关联宿舍电费；更新凭证后重新绑定一次即可补上")
+        else:
+            lines.append("⚠️ 未自动关联宿舍电费（请检查 room token 是否在电费 aid 下也存在）")
         lines.extend(fee_lines)
         lines.append(
             f"预警线：{self._cfg_float('threshold_warn', 10):g}；"
@@ -1820,7 +1861,11 @@ class DormElectricPlugin(Star):
             f"{params['floor'].get('floor')}/{params['room'].get('room')}"
         )
         fees = {"ac": self._fee_entry(params)}
-        elec = await self._match_elec_fee(params)
+        elec_expired = False
+        try:
+            elec = await self._match_elec_fee(params)
+        except SessionExpiredError:
+            elec, elec_expired = None, True
         if elec:
             fees["elec"] = elec
         # 只读：构造临时 binding 走 _fetch_fees，不落库、不写历史
@@ -1831,7 +1876,11 @@ class DormElectricPlugin(Star):
         lines = [f"⚡ {label}"]
         lines.extend(self._format_fee_results(results, include_missing=True))
         if "elec" not in fees:
-            lines.append("（该房间没有对应的宿舍电费项目，只查到空调费）")
+            lines.append(
+                "（查询时凭证失效，宿舍电费未查）"
+                if elec_expired
+                else "（该房间没有对应的宿舍电费项目，只查到空调费）"
+            )
         return "\n".join(lines)
 
     @filter.llm_tool(name="dorm_electric_query_room")

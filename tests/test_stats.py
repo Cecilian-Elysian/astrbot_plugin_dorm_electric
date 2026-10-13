@@ -85,10 +85,22 @@ def test_resolve_tz_offset_alias():
     assert resolve_tz("CST") == timezone(timedelta(hours=8))
 
 
+def test_resolve_tz_cn_aliases():
+    """用户手填 config 最常写成 Asia/Beijing / PRC / UTC+8，静默回退 UTC 会差 8 小时。"""
+    for name in ("Asia/Beijing", "PRC", "PRC/Beijing", "UTC+8", "GMT+8", "8", "0800"):
+        assert resolve_tz(name) == timezone(timedelta(hours=8)), name
+
+
+def test_resolve_tz_missing_config_defaults_to_cn():
+    """配置项缺失（空/None）= 按国内用户算，比回退 UTC 合理。"""
+    assert resolve_tz("") == timezone(timedelta(hours=8))
+    assert resolve_tz(None) == timezone(timedelta(hours=8))
+
+
 def test_resolve_tz_fallback_utc():
     assert resolve_tz("Mars/Olympus") == timezone.utc
-    assert resolve_tz("") == timezone.utc
-    assert resolve_tz(None) == timezone.utc
+    # 越界的数字偏移不再被当成合法时区（否则 +99 会静默变成 99 小时后）
+    assert resolve_tz("99") == timezone.utc
 
 
 def test_parse_daily_time_valid():
