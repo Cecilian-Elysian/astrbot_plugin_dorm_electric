@@ -119,20 +119,24 @@ def _push_args(**kw) -> argparse.Namespace:
     return argparse.Namespace(**base)
 
 
-def test_push_aborts_without_creds_and_never_prints_value(monkeypatch, capsys):
+def test_push_aborts_without_creds_but_keeps_value_recoverable(monkeypatch, capsys):
+    """凭证只存在于本次进程：推送走不通必须把它打出来，否则用户得重来一遍
+    「杀进程 → 重启企业微信 → 点页面」。"""
     monkeypatch.setattr(ec, "_ask_bot_field", lambda *a: "")
     secret = "SECRET_SESSION_VALUE_0123456789"
     assert ec._push_and_report(_push_args(), secret) == 3
-    out = capsys.readouterr()
-    assert secret not in out.out and secret not in out.err
-    assert "--ready" in out.err  # 给出「怎么手动发」的路径
+    err = capsys.readouterr().err
+    assert secret in err
+    assert "/电费 凭证 JSESSIONID=" + secret in err
+    assert "不要发到群里" in err
 
 
-def test_push_abort_prints_value_only_with_no_mask(monkeypatch, capsys):
+def test_push_abort_explains_how_to_avoid_next_time(monkeypatch, capsys):
     monkeypatch.setattr(ec, "_ask_bot_field", lambda *a: "")
-    secret = "SECRET_SESSION_VALUE_0123456789"
-    assert ec._push_and_report(_push_args(no_mask=True), secret) == 3
-    assert secret in capsys.readouterr().err
+    assert ec._push_and_report(_push_args(), "v") == 3
+    err = capsys.readouterr().err
+    for var in ("ASTRBOT_URL", "ASTRBOT_USER", "ASTRBOT_PASS"):
+        assert var in err
 
 
 def test_push_never_calls_bot_when_user_gives_up(monkeypatch):
@@ -141,49 +145,149 @@ def test_push_never_calls_bot_when_user_gives_up(monkeypatch):
     assert ec._push_and_report(_push_args(), "v") == 3
 
 
-# ---------------- 密码输入 ----------------
+# ---------------- 密码输入（星号掩码） ----------------
+
+
+def _keys(seq: str):
+    """把字符串变成逐字符的 read_char 可调用对象。"""
+    it = iter(seq)
+    return lambda: next(it)
+
+
+def _writer():
+    buf: list[str] = []
+    return buf, buf.append
+
+
+def test_secret_masks_every_char():
+    out, write = _writer()
+    assert ec._read_secret(_keys("abc123\r"), write) == "abc123"
+    assert "".join(out) == "******\n"
+
+
+def test_secret_backspace_erases_star_and_char():
+    out, write = _writer()
+    # 打 abc → 退格 → 打 xy → 回车
+    assert ec._read_secret(_keys("abc\bxy\r"), write) == "abxy"
+    assert out == ["*", "*", "*", "\b \b", "*", "*", "\n"]
+
+
+def test_secret_backspace_on_empty_does_nothing():
+    out, write = _writer()
+    assert ec._read_secret(_keys("\b\ba\r"), write) == "a"
+    assert out == ["*", "\n"]
+
+
+def test_secret_accepts_delete_key_backspace():
+    out, write = _writer()
+    assert ec._read_secret(_keys("ab\x7fa\r"), write) == "aa"
+    assert out == ["*", "*", "\b \b", "*", "\n"]
+
+
+def test_secret_empty_submit():
+    out, write = _writer()
+    assert ec._read_secret(_keys("\r"), write) == ""
+    assert out == ["\n"]
+
+
+def test_secret_accepts_both_newline_conventions():
+    _out, write = _writer()
+    assert ec._read_secret(_keys("pw\n"), write) == "pw"
+    out2, _ = _writer()
+    assert ec._read_secret(_keys("pw\r"), out2.append) == "pw"
+
+
+def test_secret_ctrl_c_aborts():
+    _out, write = _writer()
+    with pytest.raises(KeyboardInterrupt):
+        ec._read_secret(_keys("ab\x03"), write)
+
+
+def test_secret_ctrl_z_aborts():
+    _out, write = _writer()
+    with pytest.raises(EOFError):
+        ec._read_secret(_keys("ab\x1a"), write)
+
+
+@pytest.mark.parametrize("prefix", ["\x00", "\xe0"])
+@pytest.mark.parametrize("code", ["H", "P", "M", "G", "O", "I"])
+def test_secret_swallows_function_key_codes(prefix, code):
+    """方向键/翻页键的第二个字节是可打印字符（'H'=Home、'P'=PgUp）。
+
+    不吞掉的话按一下方向键就会凭空多出一个星号、密码末尾多个字母。
+    """
+    out, write = _writer()
+    assert ec._read_secret(_keys(f"ab{prefix}{code}cd\r"), write) == "abcd"
+    assert out == ["*", "*", "*", "*", "\n"]
+
+
+def test_secret_masks_non_ascii():
+    out, write = _writer()
+    assert ec._read_secret(_keys("密碼\r"), write) == "密碼"
+    assert "".join(out) == "**\n"
+
+
+def test_secret_pasted_password_is_read_whole():
+    out, write = _writer()
+    pasted = "Loki8986@" + "\r"
+    assert ec._read_secret(_keys(pasted), write) == "Loki8986@"
+    assert out.count("*") == 9
+
+
+def test_secret_ignores_other_control_chars():
+    _out, write = _writer()
+    assert ec._read_secret(_keys("a\x07b\tc\r"), write) == "abc"
+
+
+# ---------------- 密码来源优先级 ----------------
 
 
 def test_password_prefers_env(monkeypatch):
     monkeypatch.setattr(ec.os, "environ", {"ASTRBOT_PASS": "from-env"})
-    monkeypatch.setattr(ec.getpass, "getpass", lambda *a: pytest.fail("不该追问"))
+    monkeypatch.setattr(ec, "_prompt_password", lambda u: pytest.fail("不该追问"))
     assert ec._ask_password("qxm") == "from-env"
 
 
-def test_password_hidden_input_is_accepted(monkeypatch, capsys):
+def test_password_uses_masked_prompt(monkeypatch, capsys):
     monkeypatch.setattr(ec.os, "environ", {})
-    monkeypatch.setattr(ec.getpass, "getpass", lambda *a: "  typed  ")
+    seen = {}
+
+    def _fake(user):
+        seen["user"] = user
+        return " typed \n"
+
+    monkeypatch.setattr(ec, "_prompt_password", _fake)
     assert ec._ask_password("qxm") == "typed"
-    assert "不会出现任何字符" in capsys.readouterr().out
+    assert seen["user"] == "qxm"
 
 
-def test_password_falls_back_to_visible_when_getpass_empty(monkeypatch, capsys):
-    monkeypatch.setattr(ec.os, "environ", {})
-    monkeypatch.setattr(ec.getpass, "getpass", lambda *a: "")
+def test_prompt_password_falls_back_without_console(monkeypatch, capsys):
+    """不是控制台时退回可见 input，不能卡死。"""
+    monkeypatch.setattr(ec.sys, "stdin", None)
     monkeypatch.setattr("builtins.input", lambda *a: "typed-visible")
-    assert ec._ask_password("qxm") == "typed-visible"
-    assert "setx ASTRBOT_PASS" in capsys.readouterr().out
+    assert ec._prompt_password("qxm") == "typed-visible"
+    assert "直接显示在屏幕上" in capsys.readouterr().out
 
 
-def test_password_falls_back_when_getpass_raises(monkeypatch):
+def test_ask_password_swallows_eof(monkeypatch):
     monkeypatch.setattr(ec.os, "environ", {})
 
-    def _boom(*a):
-        raise OSError("no console")
-
-    monkeypatch.setattr(ec.getpass, "getpass", _boom)
-    monkeypatch.setattr("builtins.input", lambda *a: "typed-after-error")
-    assert ec._ask_password("qxm") == "typed-after-error"
-
-
-def test_password_aborts_on_eof(monkeypatch, capsys):
-    monkeypatch.setattr(ec.os, "environ", {})
-
-    def _eof(*a):
+    def _eof(user):
         raise EOFError
 
-    monkeypatch.setattr(ec.getpass, "getpass", _eof)
+    monkeypatch.setattr(ec, "_prompt_password", _eof)
     assert ec._ask_password("qxm") == ""
+
+
+def test_ask_password_swallows_console_error(monkeypatch, capsys):
+    monkeypatch.setattr(ec.os, "environ", {})
+
+    def _boom(user):
+        raise OSError("no console")
+
+    monkeypatch.setattr(ec, "_prompt_password", _boom)
+    assert ec._ask_password("qxm") == ""
+    assert "星号输入不可用" in capsys.readouterr().out
 
 
 def test_push_skips_when_password_missing(monkeypatch, capsys):
@@ -191,8 +295,23 @@ def test_push_skips_when_password_missing(monkeypatch, capsys):
     monkeypatch.setattr(ec, "_ask_password", lambda user: "")
     monkeypatch.setattr(ec, "bot_login", lambda *a: pytest.fail("不该用空密码登录"))
     args = _push_args(bot_url="http://x:6185", bot_user="qxm")
-    assert ec._push_and_report(args, "v") == 3
-    assert "ASTRBOT_PASS" in capsys.readouterr().err
+    assert ec._push_and_report(args, "captured-value") == 3
+    err = capsys.readouterr().err
+    assert "没拿到密码" in err and "captured-value" in err
+
+
+def test_push_recovers_value_when_login_fails(monkeypatch, capsys):
+    monkeypatch.setattr(ec, "_ask_bot_field", lambda v, *a: v or "http://x:6185")
+    monkeypatch.setattr(ec, "_ask_password", lambda user: "pw")
+
+    def _boom(*a):
+        raise RuntimeError("登录失败（HTTP 401）")
+
+    monkeypatch.setattr(ec, "bot_login", _boom)
+    args = _push_args(bot_url="http://x:6185", bot_user="qxm")
+    assert ec._push_and_report(args, "captured-value") == 3
+    err = capsys.readouterr().err
+    assert "登录失败（HTTP 401）" in err and "captured-value" in err
 
 
 # ---------------- 依赖预检 ----------------

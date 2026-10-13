@@ -29,14 +29,14 @@
 - 本脚本只在本机运行，不会被插件加载（AstrBot 只加载 main.py），
   也不进 requirements.txt（插件运行时不依赖它）。
 - 企业微信运行时会锁住 Cookies 库，此时用 esentutl 拷贝副本再读。
-- --watch/--push 为纯标准库实现（urllib/getpass/ctypes），无新增依赖；
+- --watch/--push 为纯标准库实现（urllib/msvcrt/ctypes），无新增依赖；
   --auto 的 CDP 通道需要 `pip install websocket-client`（缺失时自动降级为只盯
   明文库并给出安装提示）。--push 的密码从环境变量 ASTRBOT_PASS 读取，
-  没有则提示输入，不落盘。
+  没有则控制台输入（每敲一个字符显示一个 *，可退格），不落盘。
 - 脚本自身已把 stdout/stderr 切到 UTF-8；若在 PowerShell 5.1 里看到中文乱码，
   那是控制台代码页问题，先执行 `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8`。
 - 隐私：机器人地址/账号从环境变量 ASTRBOT_URL / ASTRBOT_USER 读取（不硬编码），
-  --push 的密码从 ASTRBOT_PASS 读取，没有则提示输入，不落盘；
+  --push 的密码从 ASTRBOT_PASS 读取，没有则星号输入，不落盘；
   控制台默认掩码显示凭证（只露前 8 位），--no-mask 才打印完整值；
   --auto 结束后自动清理快照临时目录并把企业微信还原为普通实例（无调试口）。
 """
@@ -46,7 +46,6 @@ from __future__ import annotations
 import argparse
 import base64
 import ctypes
-import getpass
 import json
 import os
 import re
@@ -899,36 +898,107 @@ def _ask_bot_field(value: str, label: str, env_name: str, example: str) -> str:
         return ""
 
 
-def _ask_password(user: str) -> str:
-    """取机器人密码：环境变量优先，否则交互输入。
+def _read_secret(read_char, write) -> str:
+    """逐字符读一行密码，每敲一个字符回显一个 *，退格可改（Windows 登录框同款）。
 
-    三个坑都在这里处理掉：
-    - getpass 不回显，对第一次用的人像「输不进去」→ 提前打一行说明；
-    - 部分终端下 getpass 读不到控制台（EOF/报错/空串）→ 自动降级成可见输入；
-    - 两次都空 → 不拿空密码去登录，直接给出 setx 提示。
+    为什么不用 getpass：它一个字都不回显，主人反馈「看不出输入了没有」，
+    像坏了似的。打星号既确认了「在动」，又暴露了长度（能发现少敲/多敲）。
+
+    read_char / write 做成参数，是为了这串状态机能被纯单测喂假按键序列，
+    不依赖真实控制台（CI 的 Ubuntu 上也跑得过）。
+
+    返回密码原文；Ctrl+C 抛 KeyboardInterrupt，Ctrl+Z 抛 EOFError。
+    """
+    buf: list[str] = []
+    while True:
+        ch = read_char()
+        if ch in ("\r", "\n"):
+            write("\n")
+            return "".join(buf)
+        if ch == "\x03":  # Ctrl+C
+            raise KeyboardInterrupt
+        if ch == "\x1a":  # Ctrl+Z
+            raise EOFError
+        if ch in ("\x00", "\xe0"):
+            # 方向键/F1 等组合键：getwch 先返回前缀码，再返回具体代码。
+            # 后面那个代码是可打印字符（'H'=Home、'P'=PgUp），不吞掉的话
+            # 按一下方向键就会凭空多出一个星号。
+            read_char()
+            continue
+        if ch in ("\b", "\x7f"):  # Backspace / Delete
+            if buf:
+                buf.pop()
+                write("\b \b")  # 抹掉一个星号
+            continue
+        if len(ch) == 1 and ch.isprintable():
+            buf.append(ch)
+            write("*")
+
+
+def _echo(text: str) -> None:
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
+def _prompt_password(user: str) -> str:
+    """真实控制台里用星号输入；拿不到 msvcrt / 不是控制台时退回可见 input()。"""
+    print(f"  AstrBot({user}) 密码（每敲一个字符显示一个 *，可退格修改）")
+    stdin = getattr(sys, "stdin", None)
+    try:
+        import msvcrt
+    except ImportError:
+        msvcrt = None  # type: ignore[assignment]
+    if msvcrt is None or stdin is None or not stdin.isatty():
+        print("  （当前环境不支持星号输入，密码会直接显示在屏幕上）")
+        return input("  密码: ")
+    print("  密码: ", end="")
+    sys.stdout.flush()
+    return _read_secret(msvcrt.getwch, _echo)
+
+
+def _ask_password(user: str) -> str:
+    """取机器人密码：环境变量优先，否则星号输入。
+
+    Ctrl+C / Ctrl+Z / 控制台异常一律当「没输入」返回空串，由调用方给出
+    setx 提示后跳过推送——绝不拿空密码去硬闯登录。
     """
     from_env = os.environ.get("ASTRBOT_PASS")
     if from_env:
         return from_env
-    print(f"  AstrBot({user}) 密码")
-    print("  （输入时屏幕上不会出现任何字符，这是正常的；打完直接按回车）")
-    value = ""
     try:
-        value = getpass.getpass("  密码: ").strip()
+        return _prompt_password(user).strip()
     except (EOFError, KeyboardInterrupt):
+        print()
         return ""
-    except Exception:
-        value = ""
-    if value:
-        return value
-    print("  没读到内容（这个终端可能不支持无回显输入），这次会显示字符：")
-    try:
-        value = input("  密码: ").strip()
-    except (EOFError, KeyboardInterrupt):
+    except Exception as e:  # 控制台异常不该让整个换凭证流程崩掉
+        print(f"\n  （星号输入不可用：{e!r}）")
         return ""
-    if value:
-        print("  提示：密码这次显示在屏幕上，可用 setx ASTRBOT_PASS 免除这一步。")
-    return value
+
+
+def _print_manual_fallback(args: argparse.Namespace, value: str, reason: str) -> None:
+    """推送走不通时的补救提示。
+
+    关键点：凭证是从企业微信内存里捕获的，**只存在于本次进程**。推送失败后
+    若不把它打出来，用户就得重来一遍「杀进程 → 重启企业微信 → 点页面」。
+    所以失败路径上宁可明文打印一次（正常路径依然掩码），并给出可直接粘贴的行。
+    """
+    print(f"✗ {reason}，推送已跳过。", file=sys.stderr)
+    print(
+        "  下次可以先设好环境变量免去这一步：\n"
+        f"    setx {BOT_URL_ENV}  \"你的机器人地址\"\n"
+        f"    setx {BOT_USER_ENV} \"你的账号\"\n"
+        f"    setx ASTRBOT_PASS   \"你的密码\"",
+        file=sys.stderr,
+    )
+    print(
+        "\n本次捕获到的凭证（已明文打印，泄露风险自负，用完清屏）："
+        f"\n  {args.name}={value}",
+        file=sys.stderr,
+    )
+    print(
+        f"\n手动补救：私聊机器人发这一行（不要发到群里）：\n  /电费 凭证 {args.name}={value}",
+        file=sys.stderr,
+    )
 
 
 def _push_and_report(args: argparse.Namespace, value: str) -> int:
@@ -946,40 +1016,19 @@ def _push_and_report(args: argparse.Namespace, value: str) -> int:
         "你的 AstrBot 用户名",
     )
     if not base or not user:
-        print("✗ 缺少机器人地址或账号，推送已跳过。", file=sys.stderr)
-        print(
-            f"  可用 {BOT_URL_ENV} / {BOT_USER_ENV} 环境变量，"
-            "或 --bot-url / --bot-user 参数，或在上面提示里输入。",
-            file=sys.stderr,
-        )
-        if getattr(args, "no_mask", False):
-            print(
-                f"\n凭证已捕获成功，手动私聊机器人发：/电费 {args.name}={value}",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                "\n凭证已捕获成功但没推送。查看完整值后手动发送："
-                f"\n  python extract_cookie.py --ready --host {args.host}"
-                "\n然后私聊机器人发上面那行。",
-                file=sys.stderr,
-            )
+        _print_manual_fallback(args, value, "缺少机器人地址或账号")
         return 3
     print("④ 推送给机器人并验证…")
     password = _ask_password(user)
     if not password:
-        print("✗ 没拿到密码，已跳过推送。", file=sys.stderr)
-        print(
-            "  可用 setx ASTRBOT_PASS \"你的密码\" 设一次，或重新运行本脚本再输入。",
-            file=sys.stderr,
-        )
+        _print_manual_fallback(args, value, "没拿到密码")
         return 3
     try:
         token = bot_login(base, user, password)
         session_id = bot_new_session(base, token)
         reply = bot_send(base, token, session_id, f"/电费 凭证 {args.name}={value}")
     except (OSError, RuntimeError, ValueError) as e:
-        print(f"✗ 推送失败：{e}", file=sys.stderr)
+        _print_manual_fallback(args, value, f"推送失败：{e}")
         return 3
 
     print("\n—— 机器人回复 ——")
