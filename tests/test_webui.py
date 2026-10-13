@@ -255,3 +255,16 @@ def test_history_gap_days_are_none():
         assert elec[2]["value"] is None
     finally:
         _uninstall_quart_stub()
+
+
+def test_history_garbage_days_falls_back_to_default():
+    """days 传非数字回默认 14，而不是落进「内部错误」。"""
+    _install_quart_stub({"umo": UMO, "days": "2weeks"})
+    try:
+        plugin = _plugin(bindings={UMO: _binding(history=True)})
+        resp = _call(plugin, plugin._web_history())
+        assert resp["success"] is True
+        assert len(resp["data"]["series"]["ac"]) == 14
+        assert resp["data"]["days"] == 14
+    finally:
+        _uninstall_quart_stub()

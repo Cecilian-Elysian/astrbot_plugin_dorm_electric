@@ -1123,8 +1123,23 @@ class DormElectricPlugin(Star):
                 self._bind_tokens.pop(umo, None)
 
     def _issue_token(self, umo: str, action: str, **payload) -> dict:
-        """生成待确认项；同一会话只保留最新一个，旧码立即作废。"""
+        """生成待确认项；同一会话只保留最新一个，旧码立即作废。
+
+        幂等防线：同会话同动作、且指向同一房间（或都不带房间，如解绑）时
+        复用未过期旧码并续期，不再生成第二个——调用方万一漏了去重判断，
+        用户也不会收到两个互相作废的码。换房间/换动作才真正发新码。
+        """
         self._purge_tokens()
+        existing = self._bind_tokens.get(umo)
+        if existing and existing.get("action") == action:
+            old_rid = ((existing.get("wizard") or {}).get("room") or {}).get("roomid")
+            new_rid = ((payload.get("wizard") or {}).get("room") or {}).get("roomid")
+            if (old_rid is not None and old_rid == new_rid) or (
+                old_rid is None and new_rid is None
+            ):
+                existing["at"] = time.time()
+                existing.setdefault("user_ok", False)
+                return existing
         token = {
             "code": generate_code(),
             "action": action,
@@ -1461,7 +1476,11 @@ class DormElectricPlugin(Star):
                 and ((pending.get("wizard") or {}).get("room") or {}).get("roomid")
                 == room_id
             ):
-                return f"改绑到 {label} 的验证码仍是 {pending['code']}，请让用户回复这个验证码。"
+                # 与 bind/unbind 去重同一红线：工具返回会进对话历史，不带码原文
+                return (
+                    f"改绑到 {label} 的确认码已经发过（用户私聊窗口可见，未过期）。"
+                    "请让用户直接回复那个验证码，不要让用户重复发起。"
+                )
             token = self._issue_token(
                 umo,
                 "rebind",

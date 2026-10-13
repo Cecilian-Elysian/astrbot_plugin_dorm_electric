@@ -283,10 +283,21 @@ def test_confirm_rejects_wrong_code():
 
 
 def test_new_token_invalidates_previous_code():
+    """目标变了（换房间/换动作）才发新码作废旧码；同目标复用见幂等测试。"""
     plugin = _plugin()
-    plugin._issue_token(UMO, "unbind", label="A-8-17")
+    plugin._issue_token(
+        UMO,
+        "bind",
+        label="A-8-17",
+        wizard={"room": {"room": "A-8-17", "roomid": 646}, "step": "bind"},
+    )
     old = _code_of(plugin)
-    plugin._issue_token(UMO, "unbind", label="A-8-17")
+    plugin._issue_token(
+        UMO,
+        "bind",
+        label="A-8-01",
+        wizard={"room": {"room": "A-8-01", "roomid": 641}, "step": "bind"},
+    )
     assert _code_of(plugin) != old
 
 
@@ -574,6 +585,61 @@ def test_bind_room_same_room_rejected():
     )
     assert "就是这个房间" in text
     assert UMO not in plugin._bind_tokens
+
+
+def test_rebind_dedup_return_has_no_code_text():
+    """重复发起同房改绑：提示重发，但工具返回不带码原文（对话历史红线）。"""
+    plugin = _plugin(bindings={UMO: _binding()})
+    event = _FakeEvent()
+    _call(plugin, plugin.tool_dorm_electric_bind_room(event, hint="A-8-01"))
+    code = plugin._bind_tokens[UMO]["code"]
+    text = _call(
+        plugin, plugin.tool_dorm_electric_bind_room(event, hint="A-8-01")
+    )
+    assert "已经发过" in text
+    assert code not in text
+
+
+def test_issue_token_is_idempotent_for_same_room():
+    """防线兜底：同动作+同房间再次 _issue_token 复用旧码并续期，不发第二个。"""
+    plugin = _plugin(bindings={UMO: _binding()})
+    wizard = {
+        "aid": "x",
+        "area": {"areaname": "校本部"},
+        "building": {"building": "春雪楼2"},
+        "floor": {"floor": "8层"},
+        "room": {"room": "A-8-01", "roomid": 641},
+        "step": "bind",
+    }
+    t1 = plugin._issue_token(UMO, "bind", label="A-8-01", wizard=dict(wizard))
+    t2 = plugin._issue_token(UMO, "bind", label="A-8-01", wizard=dict(wizard))
+    assert t1 is t2  # 同一个 token，码没换
+    assert plugin._bind_tokens[UMO]["code"] == t1["code"]
+    assert t2["at"] >= t1["at"]  # 续期
+    # 换房间必须发新码
+    other = dict(wizard, room={"room": "A-8-02", "roomid": 642})
+    t3 = plugin._issue_token(UMO, "bind", label="A-8-02", wizard=other)
+    assert t3 is not t1 and t3["code"] != t1["code"]
+    # 换动作也发新码
+    t4 = plugin._issue_token(UMO, "unbind", label="A-8-02")
+    assert t4["code"] != t3["code"]
+
+
+def test_issue_token_reuse_keeps_user_ok():
+    """用户已回码、还没 confirm 时工具重发同请求：不能把 user_ok 打回 False。"""
+    plugin = _plugin(bindings={UMO: _binding()})
+    wizard = {
+        "aid": "x",
+        "area": {"areaname": "校本部"},
+        "building": {"building": "春雪楼2"},
+        "floor": {"floor": "8层"},
+        "room": {"room": "A-8-01", "roomid": 641},
+        "step": "bind",
+    }
+    t1 = plugin._issue_token(UMO, "bind", label="A-8-01", wizard=dict(wizard))
+    t1["user_ok"] = True
+    t2 = plugin._issue_token(UMO, "bind", label="A-8-01", wizard=dict(wizard))
+    assert t2["user_ok"] is True
 
 
 def test_bind_room_hint_rebind_group_denied():

@@ -6,7 +6,7 @@ var chart = null, days = 14, timer = null, overview = null;
 
 function esc(s) {
   return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    .replace(/'/g, "&#39;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 function fmt(v) { return (v != null) ? Number(v).toFixed(2) : "—"; }
 function isDark() { return !!(B && B.getContext && B.getContext() && B.getContext().isDark); }
@@ -120,6 +120,8 @@ async function loadChart() {
     if (!r || !r.success) throw new Error((r && r.message) || "接口返回异常");
     renderChart(r.data);
   } catch (e) {
+    // 拉取失败要把旧图销毁，别留一个指向隐藏画布的实例
+    if (chart) { chart.destroy(); chart = null; }
     empty.classList.remove("hidden"); cv.style.display = "none";
   }
 }
@@ -190,7 +192,8 @@ async function main() {
   document.getElementById("session-selector").addEventListener("change", loadChart);
 
   await loadOverview();
-  timer = setInterval(loadOverview, 30000);
+  // 数据是分钟级轮询产生的，60 秒刷新足够；30 秒只会白打接口
+  timer = setInterval(loadOverview, 60000);
   window.addEventListener("beforeunload", function () {
     if (timer) clearInterval(timer);
     if (chart) chart.destroy();

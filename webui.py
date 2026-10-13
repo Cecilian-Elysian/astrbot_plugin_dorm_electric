@@ -101,7 +101,11 @@ async def history(plugin) -> dict:
         except ImportError:
             return {"success": False, "message": "宿主 Web 框架不可用"}
         umo = str(request.args.get("umo", ""))
-        days = max(1, min(60, int(request.args.get("days", 14))))
+        try:
+            days = int(request.args.get("days", 14))
+        except (TypeError, ValueError):
+            days = 14  # 乱传参数回默认值，别让 ValueError 落进「内部错误」
+        days = max(1, min(60, days))
         binding = plugin.store.get_binding(umo) if plugin.store else None
         if not binding:
             return {"success": False, "message": "会话不存在或未绑定"}
