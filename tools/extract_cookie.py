@@ -94,6 +94,9 @@ WATCH_POLL_SECONDS = 2.0
 VERB_WAIT_SECONDS = 20
 MANUAL_WAIT_SECONDS = 300
 
+# 本次运行创建的 Cookie 快照临时目录（收尾时无条件清理）
+_SNAP_DIRS: list[Path] = []
+
 # ---- 全自动模式（--auto，CDP 捕获通道）----
 # 不加 --remote-allow-origins=*：该开关会让任意网页都能连调试口（DNS 重绑定风险），
 # 本脚本直连 127.0.0.1 的 HTTP /json 端点，不需要它。
@@ -104,6 +107,11 @@ WXWORK_DEBUG_ARGS = (
 )
 AUTO_POLL_SECONDS = 3.0
 AUTO_CDP_BOOT_SECONDS = 120  # 重启后等调试口就绪（含扫码登录时间）
+
+# 所有 urllib 请求一律绕过系统代理：开着 Clash 时 ProxyHandler 会把
+# 127.0.0.1:9222 的调试口请求也劫持走（连不上 = 误判成「没捕获到凭证」），
+# 学校缴费系统同样需要直连。脚本不提供「走代理」开关。
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def _out() -> None:
@@ -321,7 +329,7 @@ def _http(
         hdrs.setdefault("Content-Type", "application/x-www-form-urlencoded")
     req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _DIRECT_OPENER.open(req, timeout=timeout) as resp:
             return resp.status, resp.read().decode("utf-8", "replace"), (
                 resp.headers.get("Content-Type") or ""
             )
@@ -433,6 +441,39 @@ def activate_wxwork_window() -> None:
 
 # ================= 全自动模式（--auto）：CDP 捕获通道 =================
 
+_DEP_HINT = (
+    "pip install pycryptodome websocket-client"
+    " -i https://pypi.tuna.tsinghua.edu.cn/simple"
+)
+
+
+def _missing_deps() -> list[str]:
+    """列出缺失的可选依赖。
+
+    缺依赖时各捕获通道会静默退化（返回空列表），用户只能看到「超时：没捕获到
+    新凭证」，完全猜不到是缺包，所以启动就先查一次。
+    """
+    missing: list[str] = []
+    try:
+        from Crypto.Cipher import AES  # noqa: F401
+    except ImportError:
+        missing.append("pycryptodome")
+    try:
+        import websocket  # noqa: F401
+    except ImportError:
+        missing.append("websocket-client")
+    return missing
+
+
+def _preflight(require_cdp: bool) -> bool:
+    """依赖预检：CDP 通道缺 websocket-client 直接无法工作，必须早失败。"""
+    missing = _missing_deps()
+    if not missing:
+        return True
+    print(f"✗ 缺少 Python 依赖：{'、'.join(missing)}", file=sys.stderr)
+    print(f"  安装：{_DEP_HINT}", file=sys.stderr)
+    return not (require_cdp and "websocket-client" in missing)
+
 
 def _kill_wxwork() -> None:
     """结束全部企业微信进程，释放 Cookies 库文件锁与 CDP 端口。"""
@@ -449,8 +490,10 @@ def _snapshot_cookie_dbs(wxwork_dir: Path) -> list[Path]:
     """锁释放窗口内把全部 Cookies 库（含 -wal/-shm）快照到临时目录。
 
     进程刚死、新进程未起的间隙里文件不锁，直接 copy2 即可；拷不动的跳过。
+    临时目录登记进 _SNAP_DIRS，哪怕一个库都没拷到也能在收尾时删掉。
     """
     tmp = Path(tempfile.mkdtemp(prefix="wxsnap_"))
+    _SNAP_DIRS.append(tmp)
     out: list[Path] = []
     for db in find_cookie_dbs(wxwork_dir):
         dst = tmp / f"{db.parent.parent.name.replace(' ', '_')}_{db.name}"
@@ -470,10 +513,16 @@ def _snapshot_cookie_dbs(wxwork_dir: Path) -> list[Path]:
 
 
 def _cleanup_snapshots(snaps: list[Path]) -> None:
-    """删除快照临时目录（里面是解密前的 Cookie 库，用完即清，不留在 %TEMP%。"""
-    if not snaps:
-        return
-    shutil.rmtree(snaps[0].parent, ignore_errors=True)
+    """删除快照临时目录（里面是解密前的 Cookie 库，用完即清，不留在 %TEMP%）。
+
+    以 _SNAP_DIRS 为准而不是 snaps：--auto 在一个库都没拷到时 snaps 为空，
+    旧实现直接 return，会在 %TEMP% 留下空的 wxsnap_* 目录。
+    """
+    dirs = set(_SNAP_DIRS)
+    dirs |= {s.parent for s in snaps if s.parent.name.startswith("wxsnap_")}
+    for d in dirs:
+        shutil.rmtree(d, ignore_errors=True)
+    _SNAP_DIRS.clear()
 
 
 def _restore_wxwork(exe: Path) -> None:
@@ -518,7 +567,7 @@ def _scan_snapshots(snaps: list[Path], host_filter: str, name: str) -> list[str]
 
 def _cdp_ready(port: int = CDP_PORT) -> bool:
     try:
-        with urllib.request.urlopen(
+        with _DIRECT_OPENER.open(
             f"http://127.0.0.1:{port}/json/version", timeout=3
         ) as resp:
             return resp.status == 200
@@ -547,7 +596,7 @@ def _cdp_cookie_values(host_filter: str, port: int = CDP_PORT) -> list[str]:
         return []
     try:
         ver = json.loads(
-            urllib.request.urlopen(
+            _DIRECT_OPENER.open(
                 f"http://127.0.0.1:{port}/json/version", timeout=5
             ).read()
         )
@@ -592,7 +641,7 @@ def _cdp_cookie_values(host_filter: str, port: int = CDP_PORT) -> list[str]:
     values: list[str] = []
     try:
         targets = json.loads(
-            urllib.request.urlopen(
+            _DIRECT_OPENER.open(
                 f"http://127.0.0.1:{port}/json/list", timeout=5
             ).read()
         )
@@ -839,16 +888,50 @@ def mask_value(value: str, keep: int = 8) -> str:
     return v[:keep] + f"…（共 {len(v)} 字符）"
 
 
+def _ask_bot_field(value: str, label: str, env_name: str, example: str) -> str:
+    """环境变量/命令行都没给时直接问用户，而不是报错退出（真·一键）。"""
+    if value:
+        return value
+    print(f"  未设置 {env_name}，请输入{label}（如 {example}；直接回车放弃推送）：")
+    try:
+        return input("  > ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return ""
+
+
 def _push_and_report(args: argparse.Namespace, value: str) -> int:
     """登录机器人 → 新会话 → 发 /电费 凭证，按回复分类给出结论。"""
-    base = str(getattr(args, "bot_url", "") or "").rstrip("/")
-    user = str(getattr(args, "bot_user", "") or "")
+    base = _ask_bot_field(
+        str(getattr(args, "bot_url", "") or ""),
+        "机器人地址（含端口，http:// 开头）",
+        BOT_URL_ENV,
+        "http://127.0.0.1:6185",
+    ).rstrip("/")
+    user = _ask_bot_field(
+        str(getattr(args, "bot_user", "") or ""),
+        "机器人账号",
+        BOT_USER_ENV,
+        "你的 AstrBot 用户名",
+    )
     if not base or not user:
+        print("✗ 缺少机器人地址或账号，推送已跳过。", file=sys.stderr)
         print(
-            f"✗ 未配置机器人地址/账号。请先设置环境变量 {BOT_URL_ENV} 与 {BOT_USER_ENV}"
-            "（或用 --bot-url/--bot-user 指定）。",
+            f"  可用 {BOT_URL_ENV} / {BOT_USER_ENV} 环境变量，"
+            "或 --bot-url / --bot-user 参数，或在上面提示里输入。",
             file=sys.stderr,
         )
+        if getattr(args, "no_mask", False):
+            print(
+                f"\n凭证已捕获成功，手动私聊机器人发：/电费 {args.name}={value}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "\n凭证已捕获成功但没推送。查看完整值后手动发送："
+                f"\n  python extract_cookie.py --ready --host {args.host}"
+                "\n然后私聊机器人发上面那行。",
+                file=sys.stderr,
+            )
         return 3
     print("④ 推送给机器人并验证…")
     password = os.environ.get("ASTRBOT_PASS") or getpass.getpass(
@@ -951,6 +1034,15 @@ def _run_auto(args: argparse.Namespace, wxwork_dir: Path) -> int:
     """全自动模式：带调试口重启企业微信 → 用户点一次缴费页 → CDP/明文库捕获 → 推送。"""
     host = args.host or DEFAULT_HOST_FILTER
 
+    # 先探测可执行文件再杀进程：旧顺序（kill 在前、find 在后）下，
+    # 「没找到 exe / 启动失败」两条早退路径会把用户的企业微信留在已关闭状态。
+    exe = find_wxwork_exe(args.wxwork_exe)
+    if exe is None:
+        print("✗ 未找到 WXWork.exe（--wxwork-exe 可指定路径）。", file=sys.stderr)
+        return 2
+    if not _preflight(require_cdp=True):
+        return 2
+
     print("① 结束现有企业微信进程，快照 Cookie 库…")
     _kill_wxwork()
     time.sleep(2.0)
@@ -958,11 +1050,6 @@ def _run_auto(args: argparse.Namespace, wxwork_dir: Path) -> int:
     seen: list[str] = _scan_snapshots(snaps, host, args.name)
     print(f"   快照 {len(snaps)} 个库，已知旧值 {len(seen)} 个")
 
-    exe = find_wxwork_exe(args.wxwork_exe)
-    if exe is None:
-        _cleanup_snapshots(snaps)
-        print("✗ 未找到 WXWork.exe（--wxwork-exe 可指定路径）。", file=sys.stderr)
-        return 2
     print(f"② 带调试口重启企业微信（{exe}）…")
     flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
         subprocess, "CREATE_NEW_PROCESS_GROUP", 0
