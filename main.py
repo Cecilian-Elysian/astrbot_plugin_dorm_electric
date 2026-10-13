@@ -413,10 +413,13 @@ class DormElectricPlugin(Star):
         return dict(zip(keys, values, strict=True))
 
     def _remember_raw(self, umo: str, results: dict[str, object]) -> None:
-        """保存最近一次查询的原始返回，供 /电费 日志 展示（按会话隔离）。"""
+        """记录最近一次查询的原始返回（供 /电费 日志 展示，按会话过滤）。
+
+        外层带 at 时间戳：_sweep_memory 据此清理失联会话的残留。
+        """
         raw = {k: v.raw for k, v in results.items() if v is not None}
         if raw:
-            self._last_raw[umo] = raw
+            self._last_raw[umo] = {"at": time.time(), "results": raw}
 
     async def _query_and_record(self, umo: str, binding: dict) -> tuple[list[str], int]:
         """查询全部费种并记录历史与原始返回；返回 (按费种格式化的行, 成功数)。"""
@@ -516,10 +519,33 @@ class DormElectricPlugin(Star):
 
     # ================= 后台任务 =================
 
+    def _sweep_memory(self) -> None:
+        """清理按会话缓存的内存态，防止长期运行只增不减（每轮轮询跑一次）。
+
+        原则：已绑定会话的一切都保留；没绑定的只留「最近还在用」的。
+        验证码走 _purge_tokens（TTL 语义在那里）；_lookup_cache 按查询文本
+        键控且已有 200 条上限淘汰，都不在这里重复管。
+        """
+        now = time.time()
+        bound = set(self.store.data.get("bindings", {})) if self.store else set()
+        self._purge_tokens()
+        # 过期静音（评估时只是跳过，条目本身会留着）
+        for umo in [u for u, until in self._alert_muted.items() if until < now]:
+            self._alert_muted.pop(umo, None)
+        # 无绑定且 7 天无活动的会话：房间记忆与最近原始返回一并清掉
+        stale = now - 7 * 24 * 3600
+        for umo, memo in list(self._last_room.items()):
+            if umo not in bound and float(memo.get("at", 0) or 0) < stale:
+                self._last_room.pop(umo, None)
+        for umo, wrap in list(self._last_raw.items()):
+            if umo not in bound and float(wrap.get("at", 0) or 0) < stale:
+                self._last_raw.pop(umo, None)
+
     async def _poll_all(self):
-        """轮询所有 hjnu 绑定：更新历史、评估预警；顺带保活会话。"""
+        """轮询全部 hjnu 绑定，记录历史、触发预警（合并同会话）。"""
         if not self.store:
             return
+        self._sweep_memory()
         keep_days = self._cfg_int("history_keep_days", 60)
         bindings = self.store.data.get("bindings", {})
         for umo, binding in list(bindings.items()):
@@ -2388,7 +2414,7 @@ class DormElectricPlugin(Star):
                 kind = ev.get("kind", "?")
                 text = ev.get("text", "")
                 lines.append(f"  {when}  [{kind}] {text}")
-        raw = self._last_raw.get(umo) or {}
+        raw = (self._last_raw.get(umo) or {}).get("results") or {}
         if raw:
             lines.append("\n🔍 最近一次原始返回（按费种）：")
             for kind, txt in raw.items():

@@ -8,6 +8,7 @@
 
 import asyncio
 import json
+import time
 
 import httpx
 import pytest
@@ -326,7 +327,7 @@ def test_terminate_cancels_tasks_before_closing_resources():
         hjnu=_FakeCloseable(),
     )
     plugin._wizard["u"] = {"step": "room"}
-    plugin._last_raw["u"] = {"ac": "raw"}
+    plugin._last_raw["u"] = {"at": time.time(), "results": {"ac": "raw"}}
     plugin._events.append({"t": 0, "kind": "poll", "text": "x", "umo": "u"})
     plugin._bind_tokens["u"] = {}
     plugin._lookup_cache["u"] = (0.0, "t")

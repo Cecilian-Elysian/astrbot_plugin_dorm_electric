@@ -165,7 +165,7 @@ def test_check_renders_four_sections_and_does_not_touch_history():
     assert "第 1 次" in text and "第 0 次" in text
     assert binding.get("history_by_fee") is None
     # 原始返回照旧刷新，供 /电费 日志 查看
-    assert set(plugin._last_raw[UMO]) == {"ac", "elec"}
+    assert set(plugin._last_raw[UMO]["results"]) == {"ac", "elec"}
 
 
 def test_check_events_are_newest_first():

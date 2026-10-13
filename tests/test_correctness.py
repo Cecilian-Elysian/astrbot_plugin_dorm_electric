@@ -366,3 +366,75 @@ def test_session_threshold_still_overrides_everything():
     cfg = _cfg({"threshold_warn_ac": 20, "threshold_critical_ac": 3})
     binding = {"thresholds": {"ac": {"warn": 8, "critical": 2}}}
     assert effective_thresholds(cfg, binding, "ac") == (8, 2)
+
+
+# ================= 2.3 内存态清扫 =================
+
+
+def _sweep_plugin(store):
+    plugin = make_plugin(store=store)
+    return plugin
+
+
+def test_sweep_keeps_bound_sessions_everything():
+    store = _FakeStore({UMO: {"room_label": "校本部/春雪楼2/8层/A-8-17"}})
+    plugin = _sweep_plugin(store)
+    ancient = time.time() - 30 * 24 * 3600
+    plugin._last_room[UMO] = {"at": ancient, "label": "A-8-17"}
+    plugin._last_raw[UMO] = {"at": ancient, "results": {"ac": "raw"}}
+    plugin._alert_muted[UMO] = time.time() + 3600
+    plugin._sweep_memory()
+    assert UMO in plugin._last_room
+    assert UMO in plugin._last_raw
+    assert UMO in plugin._alert_muted  # 未到期的静音不动
+
+
+def test_sweep_drops_stale_unbound_sessions():
+    store = _FakeStore({})
+    plugin = _sweep_plugin(store)
+    ancient = time.time() - 30 * 24 * 3600
+    fresh = time.time()
+    plugin._last_room["qq:private:stale"] = {"at": ancient, "label": "x"}
+    plugin._last_raw["qq:private:stale"] = {"at": ancient, "results": {"ac": "x"}}
+    plugin._last_room["qq:private:fresh"] = {"at": fresh, "label": "y"}
+    plugin._last_raw["qq:private:fresh"] = {"at": fresh, "results": {"ac": "y"}}
+    plugin._alert_muted["qq:private:stale"] = ancient  # 已过期
+    plugin._alert_muted["qq:private:fresh"] = fresh + 60
+    plugin._sweep_memory()
+    assert "qq:private:stale" not in plugin._last_room
+    assert "qq:private:stale" not in plugin._last_raw
+    assert "qq:private:stale" not in plugin._alert_muted
+    assert "qq:private:fresh" in plugin._last_room
+    assert "qq:private:fresh" in plugin._last_raw
+    assert "qq:private:fresh" in plugin._alert_muted
+
+
+def test_sweep_purges_expired_confirm_tokens():
+    store = _FakeStore({})
+    plugin = _sweep_plugin(store)
+    now = time.time()
+    plugin._bind_tokens["qq:private:old"] = {"code": "111111", "at": now - 9999}
+    plugin._bind_tokens["qq:private:new"] = {"code": "222222", "at": now}
+    plugin._sweep_memory()
+    assert "qq:private:old" not in plugin._bind_tokens
+    assert "qq:private:new" in plugin._bind_tokens  # 有效码不能被误清
+
+
+def test_last_raw_wrapper_shape_survives_log_render():
+    """cmd_log 读 results 包装层；包装改坏时这里先红。"""
+    store = _FakeStore({UMO: {"room_label": "校本部/春雪楼2/8层/A-8-17"}})
+    plugin = _sweep_plugin(store)
+    plugin._last_raw[UMO] = {"at": time.time(), "results": {"ac": "RAW_TEXT"}}
+
+    class _Ev:
+        unified_msg_origin = UMO
+
+        def plain_result(self, text):
+            return text
+
+    async def _drive():
+        return [item async for item in plugin.cmd_log(_Ev(), None)]
+
+    lines = asyncio.run(_drive())
+    text = "".join(str(x) for x in lines)
+    assert "RAW_TEXT" in text
