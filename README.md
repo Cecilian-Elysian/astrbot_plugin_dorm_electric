@@ -12,13 +12,12 @@
 
 ## 快速开始
 
-1. 将本目录复制到 AstrBot 的 `data/plugins/astrbot_plugin_dorm_electric/`
-2. 在 WebUI 重载插件，依赖（httpx[socks]、apscheduler）会自动安装
-3. **获取凭证**（hjnu 模式必需）：按下方[获取 JSESSIONID](#获取-jsessionid)操作，拿到后**私聊**机器人发送 `/电费 凭证 JSESSIONID=xxxx`
-4. **二选一**完成绑定：
-   - **跟机器人聊天**（推荐）：私聊说「我住春雪楼2 八层 A817」，它会带你走完流程；收到 6 位确认码后把数字发回去即可
-   - **手动指令**：私聊 `/电费 绑定`，按提示发 `/电费 校区`、`楼栋`、`楼层`、`房间`，最后 `/电费 绑定 1`。绑定一次会自动关联空调费与宿舍电费两个项目下的同一房间
-5. （可选）在 WebUI 插件配置里调整预警线、轮询间隔、每日播报时间；想用 AI 对话见[与 AI 对话](#与-ai-对话)
+1. 将本目录复制到 AstrBot 的 `data/plugins/astrbot_plugin_dorm_electric/`，在 WebUI 重载插件（依赖 httpx[socks]、apscheduler 自动安装）
+2. **获取凭证**（hjnu 模式必需）：按[获取 JSESSIONID](#获取-jsessionid)操作，拿到后**私聊**机器人发送 `/电费 凭证 JSESSIONID=xxxx`
+3. **二选一**完成绑定：
+   - **跟机器人聊天**（推荐）：私聊说「我住春雪楼2 八层 A817」，收到 6 位确认码后把数字发回去即可
+   - **手动指令**：私聊 `/电费 绑定`，按提示发 `/电费 校区`、`楼栋`、`楼层`、`房间`，最后 `/电费 绑定 1`（自动关联空调费与宿舍电费两个项目下的同一房间）
+4. （可选）WebUI 插件配置里调整预警线、轮询间隔、播报时间；想用 AI 对话见[与 AI 对话](#与-ai-对话)
 
 ## 获取 JSESSIONID
 
@@ -26,12 +25,7 @@
 
 ### 方式一：一键更新（推荐，WXWork 5.0.11+ 实测可用）
 
-双击仓库里的 `tools/更新电费凭证.bat`（首次先 `pip install pycryptodome websocket-client`）。脚本会：
-
-1. 自动**带调试口重启企业微信**（登录态保留，一般不用扫码）
-2. 提示你在客户端里**点开一次**「网上缴学杂费 / 校园一卡通」页面——这是唯一需要动手的一步
-3. 通过 CDP（Chrome DevTools 协议）从 webview 内存读出 `JSESSIONID`，学校验活通过后**自动私聊推给机器人**并回显结果
-4. 结束后清理临时快照，并把企业微信**还原为普通实例**（关掉调试口）
+双击 `tools/更新电费凭证.bat`（首次先 `pip install pycryptodome websocket-client`）。脚本自动带调试口重启企业微信（登录态保留）→ 提示你**点开一次**「网上缴学杂费 / 校园一卡通」页面（唯一手动动作）→ 通过 CDP（Chrome DevTools 协议）从 webview 内存读出 `JSESSIONID`，学校验活通过后**自动私聊推给机器人**并回显 → 结束后清理快照并把企业微信还原为普通实例。
 
 机器人地址与账号**不写死在脚本里**，从环境变量读取（未设置则推送前报错）：
 
@@ -40,20 +34,19 @@ setx ASTRBOT_URL "http://你的服务器:6185"
 setx ASTRBOT_USER "你的账号"
 ```
 
-等价的命令行：`python tools/extract_cookie.py --host pay2.hjnu.edu.cn --auto --push`。控制台默认**掩码显示**凭证（只露前 8 位），要看完整值加 `--no-mask`。
+等价命令行：`python tools/extract_cookie.py --host pay2.hjnu.edu.cn --auto --push`。控制台默认**掩码显示**凭证（只露前 8 位），`--no-mask` 看完整值。
 
 ### 方式二：手动提取（老版本企业微信 / CDP 不可用时）
 
-1. **先让 Cookie 入库**：在 PC 端企业微信里成功打开一次「校园一卡通 / 缴电费」页面（能看到余额即可）
-2. 运行仓库内的 `tools/extract_cookie.py`（仅本机运行，插件本身不依赖它）：
+先在 PC 端企业微信里成功打开一次「校园一卡通 / 缴电费」页面让 Cookie 入库（能看到余额即可），再运行仓库内的 `tools/extract_cookie.py`（仅本机运行，插件本身不依赖它）：
 
-   ```bash
-   pip install pycryptodome
-   python tools/extract_cookie.py                      # 列出命中的 cookie
-   python tools/extract_cookie.py --ready              # 只输出 JSESSIONID=xxx，便于脚本化
-   ```
+```bash
+pip install pycryptodome
+python tools/extract_cookie.py                      # 列出命中的 cookie
+python tools/extract_cookie.py --ready              # 只输出 JSESSIONID=xxx，便于脚本化
+```
 
-3. **私聊**机器人发送 `/电费 凭证 JSESSIONID=xxxx`，热更新生效，不用重启
+拿到后**私聊**机器人发送 `/电费 凭证 JSESSIONID=xxxx`，热更新生效不用重启。
 
 > ⚠️ 新版企业微信（5.0.11+）的 Cookie 已写入加密库，纯读库路线失效，只能用方式一；`/电费 凭证` **仅限私聊**（cookie 是全局会话密钥，群聊发送会导致群员互相覆盖）。
 
@@ -99,25 +92,22 @@ AI：✅ 已绑定 校本部/春雪楼2/8层/A-8-17
 
 要点：
 
-- **「同意」由插件强制**：确认码必须是用户亲手发回来的。插件在事件级监听用户原始消息，整条消息里除标点外只剩那 6 位数字才算数（「验证码是 481526」「确认 481526」在私聊也算），所以群里问「481526 度电够吗」不会误判。AI 自己拿着码调 `confirm` 会被拒绝。
-- **验证码 6 位、5 分钟有效、一次性**，每会话只留最新一个；有效期由 `ai_bind_code_ttl` 配置。
-- **群聊只读**：绑定/解绑/改绑一律引导私聊。群里报房间号可查任意宿舍余额（只返回房间名与余额，不返回内部 ID）——**知情记录**：任何人都能查任何房间。
-- **模糊候选反问，绝不猜着办**：房号打错（「A-8-71」）时列出最接近的候选反问，确认前不发码。
-- **会话房间记忆**：定位过的房间记 30 分钟，之后只说「绑定」「春雪」这类碎片也能直接办（DM 显示完整房间名，绑错不回码即可）。
-- **查询类工具不写历史**：AI 反复追问不会稀释「24h 用电 / 日均」统计；房间反查按 `ai_lookup_cache_seconds` 缓存，避免打爆学校接口。
-- **幕后指令注入**（v1.1.7 起）：聊到电费相关话题时自动在 system_prompt 追加一段提醒，要求模型必须调工具拿真实数据、严禁编造余额——修掉弱函数调用模型「明明有工具却想不起来用」的问题。纯追加、幂等、不改人格设定，`ai_prompt_hint=false` 可整体关闭。
-- **工具永远不输出凭证值**、学校原始返回、其它会话的数据（工具结果会进 LLM 上下文，等于公开）。`ai_tools_enabled=false` 可一键关掉全部工具。
+- **「同意」由插件强制**：确认码必须是用户亲手发回来的——插件在事件级监听原始消息，整条消息里除标点外只剩那 6 位数字才算数（私聊里「确认 481526」「验证码是 481526」也算），群里问「481526 度电够吗」不会误判；AI 自己拿着码调 `confirm` 会被拒绝。验证码 6 位、5 分钟有效、一次性
+- **群聊只读**：绑定/解绑/改绑一律引导私聊。群里报房间号可查任意宿舍余额（只返回房间名与余额，不返回内部 ID）——**知情记录**：任何人都能查任何房间
+- **绝不猜着办**：房号打错（「A-8-71」）时列出最接近的候选反问，确认前不发码；定位过的房间记 30 分钟，之后只说「绑定」「春雪」这类碎片也能直接办
+- **查询类工具不写历史**：AI 反复追问不会稀释「24h 用电 / 日均」统计；房间反查按 `ai_lookup_cache_seconds` 缓存，避免打爆学校接口
+- **幕后指令注入**（v1.1.7 起）：聊到电费话题时自动在 system_prompt 追加一段提醒，要求模型必须调工具、严禁编造余额——修掉弱函数调用模型「明明有工具却想不起来用」。纯追加、幂等、不改人格设定，`ai_prompt_hint=false` 可关
+- **工具永远不输出凭证值**、学校原始返回、其它会话数据（工具结果会进 LLM 上下文，等于公开）。`ai_tools_enabled=false` 可一键关掉全部工具
 
 ### 部署要点
 
-1. WebUI 更新/重载插件后，到「插件 → 管理行为 → 函数工具」确认 10 个 `dorm_electric_*` 已启用（新增工具默认启用）
-2. **人格设定的「可用工具」要是「全部」**；白名单模式必须把工具加进去，否则模型看不见
-3. 主模型必须支持 function calling；不支持时 AstrBot 会自动摘掉工具（模型侧报 `tool call is not supported`），此时 AI 能力不可用但 `/电费` 指令不受影响
-4. `/电费 确认 [验证码]` 是 AI 走不通时的兜底（模型不支持工具、白名单漏配、群聊唤醒规则拦掉纯数字消息时都能用）
+1. WebUI「插件 → 管理行为 → 函数工具」确认 10 个 `dorm_electric_*` 已启用（新增默认启用）；**人格设定的「可用工具」要是「全部」**，白名单模式漏配模型就看不见
+2. 主模型必须支持 function calling；不支持时 AstrBot 会自动摘掉工具（模型侧报 `tool call is not supported`），此时 AI 能力不可用但 `/电费` 指令不受影响
+3. `/电费 确认 [验证码]` 是 AI 走不通时的兜底（工具被摘、白名单漏配、群聊唤醒规则拦掉纯数字消息时都能用）
 
 ### 想让机器人在群里主动开口
 
-插件不负责这个，属 AstrBot 自身配置（按配置档生效，群聊通常走 `default` 档）：
+属 AstrBot 自身配置（按配置档生效，群聊通常走 `default` 档）：
 
 - `provider_ltm_settings.group_icl_enable` + `active_reply`（`enable` / `possibility_reply` 概率 / `whitelist`）。**注意开 `group_icl_enable` 会把群聊记录注入系统提示词，每轮 prompt 都在变，prompt 缓存失效、token 成本明显上升**
 - 主动型 Agent（未来任务，v4.14+ 实验性），OneBot v11（QQ）支持主动推送
@@ -194,7 +184,6 @@ AstrBot WebUI（v4.6+）打开「插件 → 宿舍电费监控」，详情页内
 | 1.1.6 | 2026-10-04 | 会话级预警线（「低于 20 提醒我」）+ 每日播报免打扰 |
 | 1.1.5 | 2026-10-04 | 改绑一步到位（一码换房）；「还能撑几天」估算；自检对话化 |
 | 1.1.0 | 2026-10-03 | 与 AI 对话：7 个 LLM 工具 + 用户确认码机制；群聊只读；`/电费 确认` 兜底 |
-| 1.0.9 | 2026-10-02 | `/电费 检查` 一键自检 |
 | 1.0.8 | 2026-09-29 | 房间列表分页；`tools/extract_cookie.py` 替代抓包 |
 | 1.0.5 | 2026-09-23 | 绑定向导重构，一次绑定自动关联两个费种 |
 
@@ -202,16 +191,14 @@ AstrBot WebUI（v4.6+）打开「插件 → 宿舍电费监控」，详情页内
 
 ```bash
 pip install httpx apscheduler pytest ruff
-python -m ruff check .
-python -m pytest -q
+python -m ruff check . && python -m pytest -q
 ```
 
-测试通过 `tests/conftest.py` 注入 astrbot 桩模块，使 `main.py` 能脱离 AstrBot 宿主直接导入；被测逻辑均为真实实现。无需 `pytest-asyncio`。CI（ruff + pytest）见 `.github/workflows/ci.yml`。
+测试通过 `tests/conftest.py` 注入 astrbot 桩模块，使 `main.py` 能脱离 AstrBot 宿主直接导入；被测逻辑均为真实实现，无需 `pytest-asyncio`。CI 见 `.github/workflows/ci.yml`。
 
 ## 灵感来源
 
-绑定向导 + 凭证保活（定时自查以维持 JSESSIONID 会话）的思路参考了华南理工大学电费查询项目
-[sxdl/elec_room_info](https://github.com/SCUT-CSSA/elec_room_info)（CC BY-NC-SA 4.0），接口实现为本项目对汉江师范学院系统的独立逆向，未复制其代码。
+绑定向导 + 凭证保活（定时自查以维持 JSESSIONID 会话）的思路参考了华南理工大学电费查询项目 [sxdl/elec_room_info](https://github.com/SCUT-CSSA/elec_room_info)（CC BY-NC-SA 4.0），接口实现为本项目对汉江师范学院系统的独立逆向，未复制其代码。
 
 ## License
 
