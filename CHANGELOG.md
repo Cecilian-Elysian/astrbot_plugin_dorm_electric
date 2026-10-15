@@ -183,3 +183,38 @@
 - 指令 `/电费 历史 [n]` 与 `/电费 日志 [n]`
 - 同一会话的空调费 + 宿舍电费低余额预警合并为一条消息推送
 - 支持 `http_proxy` 配置（直连 / HTTP / SOCKS5）
+
+---
+
+## 技术细节存档（自 README 移出）
+
+面向维护者的实现笔记，保留结论与踩坑，不影响使用者。
+
+### `tools/extract_cookie.py`：凭证提取原理
+
+- **WXWork 5.0.11 起**工作台/公众号 H5 的 Cookie 写入加密库 `Profiles\<hash>\webview\webview.db`（自研格式、非 SQLCipher、非 SQLite 明文头），**明文库读库路线已失效**，只剩 CDP 路线
+- CDP 通道原理：企业微信是 Chromium 内核，接受 `--remote-debugging-port=9222 --no-sandbox` 启动参数；脚本重启客户端后用 `Target.attachToTarget` + `Network.getAllCookies` 读页面内存里的 Cookie（需 `websocket-client`，连接时要 `suppress_origin` 否则 403）
+- **CDP 就绪实例上用户自己打开的真实页面会出现在 `/json/list`**（这就是捕获成功的通道）；CDP 自建的 `Target.createTarget` 走 docs 实例（cache-path=Global\CefCache），其 jar 里没有 pay2 会话
+- ⚠️ OAuth 授权页 `open.weixin.qq.com/connect/oauth2/authorize` 由**服务端**校验客户端身份，CDP 自建标签打开只会得到「请在企业微信客户端打开链接」——脚本没法替用户开页面，必须借用户点开的页面
+- Cookie 库位置（老版本明文路线）：`%USERPROFILE%\Documents\WXWork\<uid>\WXWorkCefCache\Network\Cookies`、`%USERPROFILE%\Documents\WXWork\qtCef\Network\Cookies`（注意 glob：`*/qtCef/...` 匹配不到，根级才是对的）
+- 主密钥：`%USERPROFILE%\Documents\WXWork\Local State` 的 `os_crypt.encrypted_key`，base64 解码后是 `b"DPAPI"` + 32 字节密钥，经 `CryptUnprotectData` 解包
+- 条目密文格式：`v10` 前缀 + 12 字节 nonce + 密文 + 16 字节 tag，AES-256-GCM
+- ⚠️ **企业微信不做 KDF 派生**（与原版 Chromium 不同）：master key 直接当 AES 密钥用；按 PBKDF2-HMAC-SHA1(`saltysalt`) 派生会全部 MAC 校验失败
+- **企业微信会锁住 Cookies 文件**：先 `shutil.copy2`，被拒时降级 `esentutl /y <src> /d <dst> /o` 绕锁拷贝；`--auto` 则在重启进程后的锁释放窗口整库快照
+- 依赖只有 `pycryptodome`（DPAPI 走 `ctypes` 直调 `crypt32.CryptUnprotectData`，不需要 `pywin32`）；`--auto` 另需 `websocket-client`
+- 学校会话是**闲置型过期**（小时级），插件 20 分钟轮询顺带保活；真过期就重跑一键更新
+
+### 学校接口与宿主机制
+
+- 接口链路：`queryElecArea → queryElecBuilding → queryElecFloor → queryElecRoom → queryElecRoomInfo`（POST 表单，层级选项为 URL 编码的 JSON 片段）；空调费从 `剩余电量...度` 解析，宿舍电费从 `余额：...元` 解析
+- 容错：5xx、网络错误、「HTTP 200 但响应不是 JSON」（学校偶发 chunked 空页抖动）都会重试 2 次；重试只标记共享客户端待重建、**不当场 `aclose()`**（并发查询仍持有），退休连接进 `_retired` 池（上限 4）
+- 未配置或过期凭证时接口干净返回 HTTP 200 + `retcode=91001`
+- `@filter.llm_tool` 的参数 schema **只从 docstring 的 `Args:` 段解析**，不读签名注解；生成的 schema 没有 `required`，所以所有工具参数都给默认值，避免模型不带参数调用时 `TypeError`
+- `return str`（协程）才会把文本作为工具结果喂给模型；`yield event.plain_result(...)` 是**直接发到聊天窗口、模型收不到**。故查询类工具一律 `return`，生成验证码的工具用 `event.send()` 原样发给用户
+- 确认码的「用户已同意」由事件级监听器标记（`@filter.event_message_type(ALL)` 高 priority，不发消息不阻断事件），与 LLM 是否被唤醒、模型是否支持 function calling 无关
+- 指令与 AI 工具共用同一套向导选择器与渲染器，**选哪一层由向导状态 `step` 决定**，模型把序号传错一层也不会选错（修掉了 `/电费 校区/楼栋/楼层/房间` 参数选上一层的错位问题）
+- 房间反查在未给楼栋楼层时有请求预算上限（`LOOKUP_ROOM_BUDGET`），先每栋楼一层再逐层轮转；全部失败时报「学校接口异常」而不是「没找到房间」
+- 指令与 AI 工具、渲染文案重构时用「HEAD 版本 vs 工作树版本字符串集合比对」验证文案逐字未变
+- 装饰器 handler 必须留在 `main.py`（宿主元数据扫描对 Mixin 未验证）；往 `async def tool_...` 前插方法时，`@filter.llm_tool` 会被顶给辅助函数——插行必须在装饰器之上（`tests/test_registration.py` 锁死注册面）
+- 数据（绑定关系、历史余额）存于 `data/plugin_data/astrbot_plugin_dorm_electric/`，原子写 + fsync + 60s 去抖，用户动作 `save(force=True)` 立即落盘，损坏文件隔离为 `*.corrupt-<ts>`
+- PowerShell 5.1 下中文乱码先 `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8`
